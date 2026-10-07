@@ -1,0 +1,19 @@
+name: schedule-probe
+
+# ⚠️ 临时探针文件 —— 仅用于验证 GitHub 定时调度是否真的注册成功。
+# 只做 echo，不签到、不推送通知。验证完毕后立即删除。
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # 每 5 分钟，仅测试期间使用
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe fired
+        run: |
+          echo "PROBE_FIRED"
+          echo "event=${{ github.event_name }}"
+          date -u "+utc=%Y-%m-%d %H:%M:%S"
