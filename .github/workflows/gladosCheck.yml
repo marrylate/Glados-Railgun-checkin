@@ -8,6 +8,8 @@ on:
       - 'README.md'
       - 'imgs/**'
   schedule:
+    # 提交本文件必须使用可关联的账号身份（<ID>+user@users.noreply.github.com），
+    # 否则 GitHub 会静默丢弃定时触发（2026-10-08 已踩坑并修复）。
     - cron: '5 16 * * *'   # UTC 16:05 = 北京时间 00:05
     - cron: '0 10 * * *'   # UTC 10:00 = 北京时间 18:00
 
