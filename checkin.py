@@ -8,6 +8,12 @@ from dataclasses import dataclass, asdict
 from pypushdeer import PushDeer
 from logging_config import init_logger
 
+# ---- Telegram 推送（新增 2026-10-07）----
+try:
+    from tg_notify import push_checkin_to_telegram
+except Exception:  # 模块缺失时不阻塞签到主流程
+    push_checkin_to_telegram = None
+
 
 class CheckinStatus(Enum):
     """签到状态"""
@@ -393,23 +399,40 @@ class CheckinResult:
 class PushService:
     """推送服务"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Optional[Config] = None):
         self.config = config
+        self.push_key = getattr(config, "push_key", "") or ""
 
     def send(self, title: str, content: str) -> bool:
-        """发送推送"""
-        if not self.config.push_key:
-            logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
-            return False
+        """发送推送：PushDeer（原有）+ Telegram（新增）"""
+        ok = False
 
-        try:
-            pushdeer = PushDeer(pushkey=self.config.push_key)
-            pushdeer.send_text(title, desp=content)
-            logger.info(f"{LogEmoji.SUCCESS} 推送通知发送成功。")
-            return True
-        except Exception as e:
-            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {e}")
-            return False
+        # 1) PushDeer（原有逻辑，未配置密钥则跳过）
+        if not self.push_key:
+            logger.info(f"{LogEmoji.WARNING} 未设置 PushDeer 密钥，跳过 PushDeer 推送。")
+        else:
+            try:
+                pushdeer = PushDeer(pushkey=self.push_key)
+                pushdeer.send_text(title, desp=content)
+                logger.info(f"{LogEmoji.SUCCESS} PushDeer 推送通知发送成功。")
+                ok = True
+            except Exception as e:
+                logger.error(f"{LogEmoji.ERROR} 发送 PushDeer 推送通知失败: {e}")
+
+        # 2) Telegram（新增，推送到「签到通知」频道）
+        if push_checkin_to_telegram is None:
+            logger.warning(f"{LogEmoji.WARNING} tg_notify 模块不可用，跳过 Telegram 推送。")
+        else:
+            try:
+                if push_checkin_to_telegram(title, content):
+                    logger.info(f"{LogEmoji.SUCCESS} Telegram 推送成功。")
+                    ok = True
+                else:
+                    logger.warning(f"{LogEmoji.WARNING} Telegram 推送未成功（未配置或发送失败）。")
+            except Exception as e:
+                logger.error(f"{LogEmoji.ERROR} Telegram 推送异常: {e}")
+
+        return ok
 
 
 class Checker:
@@ -521,6 +544,7 @@ logger = init_logger()
 
 def main():
     """主函数"""
+    config = None
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -546,7 +570,7 @@ def main():
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
+    push_service = PushService(config)
     push_service.send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成")
 
