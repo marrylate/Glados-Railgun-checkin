@@ -1,0 +1,72 @@
+name: upstream watch
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 1'   # UTC 02:00 周一 = 北京时间 周一 10:00
+
+jobs:
+  watch:
+    name: check upstream updates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          ref: master
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests telethon PySocks
+
+      # 只查有没有新提交，有就推 TG；不自动合并
+      - name: Check upstream
+        id: watch
+        run: python upstream_watch.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          TG_NOTIFY_CHANNEL_ID: ${{ secrets.TG_NOTIFY_CHANNEL_ID }}
+          TG_NOTIFY_CHANNEL_HASH: ${{ secrets.TG_NOTIFY_CHANNEL_HASH }}
+
+      # 记录已读到的上游 SHA，下次才能判断"有没有新东西"
+      - name: Commit state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain upstream_state.json)" ]; then
+            git add upstream_state.json
+            git commit -m "chore: update upstream watch state [skip ci]"
+            git push origin master
+          else
+            echo "upstream_state.json 无变化，跳过提交"
+          fi
+
+      # 查询失败时补一条告警（成功情况下脚本自己会推，这里不重复）
+      - name: Fallback notify
+        if: failure()
+        run: |
+          python tg_notify.py --fallback "上游监测失败" "检查上游更新时出错，请查看运行日志。"
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          TG_NOTIFY_CHANNEL_ID: ${{ secrets.TG_NOTIFY_CHANNEL_ID }}
+          TG_NOTIFY_CHANNEL_HASH: ${{ secrets.TG_NOTIFY_CHANNEL_HASH }}
