@@ -5,7 +5,7 @@ name: schedule-probe
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # 每 5 分钟，仅测试期间使用
+    - cron: '7 4 * * *'   # 每天 UTC 04:07 = 北京 12:07（低频探子）
   workflow_dispatch:
 
 jobs:
