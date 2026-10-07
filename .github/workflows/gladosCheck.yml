@@ -8,7 +8,8 @@ on:
       - 'README.md'
       - 'imgs/**'
   schedule:
-    - cron: '0 4,10 * * *'
+    - cron: '5 16 * * *'   # UTC 16:05 = 北京时间 00:05
+    - cron: '0 10 * * *'   # UTC 10:00 = 北京时间 18:00
 
 jobs:
   build:
