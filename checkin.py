@@ -111,8 +111,13 @@ class Config:
     """默认是否输出详细响应"""
     DEFAULT_VERBOSE = False
 
-    """默认域名"""
-    DOMAINS = ["glados.cloud", "railgun.info"]
+    """默认域名（可用环境变量 GLADOS_DOMAINS 覆盖，逗号分隔）
+    说明：railgun.info 与 glados.cloud 是两套独立账号体系，需要各自的 Cookie；
+    默认只跑 glados.cloud，需要 railgun 时设置 GLADOS_DOMAINS=glados.cloud,railgun.info
+    """
+    DEFAULT_DOMAINS = ["glados.cloud"]
+    ENV_DOMAINS = "GLADOS_DOMAINS"
+    DOMAINS = DEFAULT_DOMAINS
 
     """兑换计划列表"""
     EXCHANGE_PLANS = {
@@ -160,7 +165,15 @@ class Config:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 的值 '{exchange_plan_env}' 无效，将使用默认兑换计划 {self.DEFAULT_EXCHANGE_PLAN}。")
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
+        raw_domains: Optional[str] = os.environ.get(self.ENV_DOMAINS, "")
+        if raw_domains and raw_domains.strip():
+            parsed = [d.strip() for d in raw_domains.split(",") if d.strip()]
+            self.DOMAINS = parsed or list(self.DEFAULT_DOMAINS)
+        else:
+            self.DOMAINS = list(self.DEFAULT_DOMAINS)
+
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
+        logger.info(f"{LogEmoji.INFO} 签到域名: {', '.join(self.DOMAINS)}")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
@@ -497,13 +510,23 @@ class Checker:
 
             # 4. 执行兑换
             required_points = self.config.EXCHANGE_PLANS.get(self.config.exchange_plan, 500)
-            self._log(
-                cookie_idx,
-                domain,
-                LogEmoji.EXCHANGE,
-                f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
-            )
-            result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+            if points_num < required_points:
+                result.exchange = f"积分不足({points_num}/{required_points})，跳过兑换"
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.EXCHANGE,
+                    f"积分不足（{points_num}/{required_points}），跳过兑换 {self.config.exchange_plan}",
+                    force=True,
+                )
+            else:
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.EXCHANGE,
+                    f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
+                )
+                result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
 
         return result
 
