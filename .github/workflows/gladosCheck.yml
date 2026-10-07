@@ -14,7 +14,7 @@ jobs:
   build:
     name: glados/railgun checkin
     runs-on: ubuntu-latest
-      
+
     permissions:
       contents: read
       actions: write
@@ -42,9 +42,11 @@ jobs:
         python -m pip install --upgrade pip
         pip install requests
         pip install pypushdeer
+        pip install telethon
 
-    # 执行 签到脚本
+    # 执行 签到脚本（签到结果会推送到 Telegram「签到通知」频道）
     - name: Running checkin
+      id: checkin
       run: |
         python checkin.py
       env:
@@ -52,10 +54,28 @@ jobs:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+        # ---- Telegram 推送（新增 2026-10-07）----
+        TG_API_ID: ${{ secrets.TG_API_ID }}
+        TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+        TG_NOTIFY_CHANNEL_ID: ${{ secrets.TG_NOTIFY_CHANNEL_ID }}
+        TG_NOTIFY_CHANNEL_HASH: ${{ secrets.TG_NOTIFY_CHANNEL_HASH }}
+
+    # 兜底通知：签到脚本已成功推送则静默跳过；脚本秒退/崩溃时补一条告警
+    - name: Fallback Telegram notify
+      if: always()
+      run: |
+        python tg_notify.py --fallback "GLaDOS 签到异常" "签到步骤结果: ${{ steps.checkin.outcome }}，脚本可能秒退或未能推送成功。"
+      env:
+        TG_API_ID: ${{ secrets.TG_API_ID }}
+        TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+        TG_NOTIFY_CHANNEL_ID: ${{ secrets.TG_NOTIFY_CHANNEL_ID }}
+        TG_NOTIFY_CHANNEL_HASH: ${{ secrets.TG_NOTIFY_CHANNEL_HASH }}
 
     - name: Keep alive
-      uses: liskin/gh-workflow-keepalive@v1 
-        
+      uses: liskin/gh-workflow-keepalive@v1
+
     - name: Delete workflow runs
       uses: Mattraks/delete-workflow-runs@v2
       with:
