@@ -606,6 +606,11 @@ class Checker:
         repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
 
+        # 供 main() 判断「本次是否全是重复签到」——全是重复时静默跳过推送，避免多时间点触发刷屏
+        self.success_count = success_count
+        self.repeat_count = repeat_count
+        self.fail_count = fail_count
+
         title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
 
         send_content_lines = []
@@ -632,6 +637,8 @@ logger = init_logger()
 def main():
     """主函数"""
     config = None
+    checker = None
+    all_repeat = False
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -651,12 +658,32 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
+            # 本次是否「全是重复签到」（今日早些时间点已经签过）
+            all_repeat = (
+                checker.success_count == 0
+                and checker.fail_count == 0
+                and checker.repeat_count > 0
+            )
+
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
         title, content, log_content = "# 脚本执行出错", str(e), str(e)
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
+    if all_repeat:
+        # 今日已签过（多时间点触发导致的重复运行）→ 静默跳过，绝不重复刷屏。
+        # 同时打上「已推送」标记，避免工作流的兜底通知误报「签到异常」。
+        logger.info(f"{LogEmoji.INFO} 本次全部为「重复签到」（今日已签过），静默跳过 Telegram 推送。")
+        try:
+            from tg_notify import mark_pushed
+
+            mark_pushed()
+        except Exception as e:
+            logger.warning(f"{LogEmoji.WARNING} 写入推送标记失败: {e}")
+        logger.info(f"{LogEmoji.END} 签到完成")
+        return
+
     push_service = PushService(config)
     push_service.send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成")
