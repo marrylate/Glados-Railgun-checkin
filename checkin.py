@@ -672,17 +672,11 @@ def main():
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
     if all_repeat:
-        # 今日已签过（多时间点触发导致的重复运行）→ 静默跳过，绝不重复刷屏。
-        # 同时打上「已推送」标记，避免工作流的兜底通知误报「签到异常」。
-        logger.info(f"{LogEmoji.INFO} 本次全部为「重复签到」（今日已签过），静默跳过 Telegram 推送。")
-        try:
-            from tg_notify import mark_pushed
-
-            mark_pushed()
-        except Exception as e:
-            logger.warning(f"{LogEmoji.WARNING} 写入推送标记失败: {e}")
-        logger.info(f"{LogEmoji.END} 签到完成")
-        return
+        # 2026-10-11 用户要求：重复运行也要发通知（否则无法判断是否又重复签到了一次）。
+        # 本次全部为「重复签到」时同样推送，标题标注「重复运行」以便与真正签到成功区分。
+        # 推送成功后 tg_notify 会打「已推送」标记，工作流兜底通知不会重复刷屏。
+        title = f"🔁 {title}（重复运行：今日已签到）"
+        logger.info(f"{LogEmoji.INFO} 本次全部为「重复签到」，按用户要求仍推送通知（标注为重复运行）。")
 
     push_service = PushService(config)
     push_service.send(title, content)
