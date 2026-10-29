@@ -180,6 +180,19 @@ def push_checkin_to_telegram(title, content):
     return ok
 
 
+def push_plain_text(text):
+    """原样推送一段文本（不加任何前后缀），供 checkin.py 用自定义排版调用"""
+    if not configured():
+        return False
+    body = (text or "").strip()
+    if not body:
+        return False
+    ok = send_message(body)
+    if ok:
+        mark_pushed()
+    return ok
+
+
 # --------------------------------------------------------------------------- #
 # 兜底通知 CLI
 # --------------------------------------------------------------------------- #

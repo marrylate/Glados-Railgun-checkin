@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -13,9 +14,10 @@ from logging_config import init_logger
 
 # ---- Telegram 推送（fork 定制，2026-10-07）----
 try:
-    from tg_notify import push_checkin_to_telegram
+    from tg_notify import push_checkin_to_telegram, push_plain_text
 except Exception:  # 模块缺失时不阻塞签到主流程
     push_checkin_to_telegram = None
+    push_plain_text = None
 
 
 class CheckinStatus(Enum):
@@ -227,6 +229,8 @@ class API:
         self.verbose: bool = verbose
         self.headers: Dict[str, str] = self._get_headers()
         self._device_ua_cache: Dict[str, str] = {}
+        # fork 定制：账号画像（get_status 顺手填充），供通知展示 email / 套餐
+        self.profile: Dict[str, object] = {"email": "", "vip": None}
         self.session = requests.Session()
         self.session.headers.update(self.headers)
         # 网络抖动时自动重试（指数退避），避免误报失败
@@ -364,6 +368,7 @@ class API:
             "points": "0",
             "message": "",
             "code": CheckinStatus.FAILURE,
+            "streak": 0,
         }
 
         if not raw:
@@ -373,6 +378,11 @@ class API:
         code = raw.get("code", -2)
         message = raw.get("message", "无消息字段")
         points = str(raw.get("points", 0))
+        try:
+            streak = int(float(raw.get("streak") or 0))
+        except (TypeError, ValueError):
+            streak = 0
+        result["streak"] = streak
 
         if code == CheckinStatus.SUCCESS.value:
             self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
@@ -419,7 +429,11 @@ class API:
         if response:
             data = response.json()
             code = data.get("code", -2)
-            left_days = data.get("data", {}).get("leftDays", None)
+            info = data.get("data") or {}
+            left_days = info.get("leftDays", None)
+            # fork 定制：顺带记录账号邮箱与 vip 等级，供 TG 通知展示（不额外发请求）
+            self.profile["email"] = info.get("email") or ""
+            self.profile["vip"] = info.get("vip", None)
 
             if left_days is not None:
                 left_days_int = int(float(left_days))
@@ -478,6 +492,21 @@ class API:
             return "兑换失败"
 
 
+# fork 定制：vip 等级 → 套餐名。当前账号 vip=11 在控制台显示为「Edu」，未知等级回退成 VIPn。
+VIP_PLAN_NAMES = {11: "Edu"}
+
+
+def plan_name(vip) -> str:
+    """把 /api/user/status 的 vip 等级转成套餐名"""
+    if vip is None:
+        return "未知"
+    try:
+        v = int(vip)
+    except (TypeError, ValueError):
+        return "未知"
+    return VIP_PLAN_NAMES.get(v, f"VIP{v}")
+
+
 @dataclass()
 class CheckinResult:
     """签到结果"""
@@ -490,6 +519,10 @@ class CheckinResult:
     points_total: str = "None"
     exchange: str = "未兑换"
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
+    email: str = ""
+    plan: str = ""
+    streak: int = 0
+    message: str = ""
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
@@ -512,6 +545,67 @@ def render_payload(payload: dict, line_sep: str = "\n") -> str:
     if note:
         lines.append(note)
     return line_sep.join(lines)
+
+
+def _bj_now() -> str:
+    """北京时间（GitHub runner 为 UTC）"""
+    import datetime
+
+    bj = datetime.datetime.now(datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+    return bj.strftime("%Y-%m-%d %H:%M")
+
+
+def _num(text) -> str:
+    """从 '303 积分' / '388 天' 取数字；含 None 的脏值返回 '未知'"""
+    s = str(text or "")
+    if not s or "None" in s:
+        return "未知"
+    m = re.findall(r"-?\d+", s)
+    return m[0] if m else s
+
+
+def render_tg(payload: dict) -> str:
+    """fork 定制（2026-10-30 用户指定格式）：Telegram「签到通知」频道排版
+
+        ✅ GLaDOS 签到成功
+        账号：xx@gmail.com
+        结果：<服务端原话>
+        今日：+10 分（日历已打卡）
+        积分：303
+        剩余天数：388 天
+        连续签到：2 天
+        套餐：Edu
+        时间：2026-10-30 00:20
+    """
+    now = _bj_now()
+    blocks = []
+    for r in payload.get("rows", []):
+        status = r.get("status", "")
+        lines = [f"{r.get('emoji', '')} GLaDOS {status}".strip()]
+        if r.get("email"):
+            lines.append(f"账号：{r['email']}")
+        if r.get("message"):
+            lines.append(f"结果：{r['message']}")
+        if status == "签到成功":
+            lines.append(f"今日：+{_num(r.get('points'))} 分（日历已打卡）")
+        elif status == "重复签到":
+            lines.append("今日：+0 分（今日已签到）")
+        if r.get("points_total"):
+            total = _num(r.get("points_total"))
+            lines.append("积分：未知" if total == "未知" else f"积分：{total}")
+        if r.get("days"):
+            days = _num(r.get("days"))
+            lines.append("剩余天数：未知" if days == "未知" else f"剩余天数：{days} 天")
+        if status in ("签到成功", "重复签到"):
+            lines.append(f"连续签到：{r.get('streak', 0)} 天")
+        if r.get("plan"):
+            lines.append(f"套餐：{r['plan']}")
+        lines.append(f"时间：{now}")
+        blocks.append("\n".join(lines))
+    note = payload.get("note")
+    if note:
+        blocks.append(str(note))
+    return "\n\n".join(blocks)
 
 
 class PushBackend:
@@ -588,6 +682,13 @@ class TelegramBackend(PushBackend):
             logger.warning(f"{LogEmoji.WARNING} [{self.name}] tg_notify 模块不可用，跳过 Telegram 推送。")
             return False
         try:
+            # fork 定制：TG 用固定字段排版（render_tg），不再复用 PushDeer 的单行格式
+            if push_plain_text is not None:
+                text = render_tg(payload)
+                if push_plain_text(text):
+                    return True
+                logger.warning(f"{LogEmoji.WARNING} [{self.name}] 推送未成功（未配置凭据或发送失败）。")
+                return False
             if push_checkin_to_telegram(title, self._render(payload)):
                 return True
             logger.warning(f"{LogEmoji.WARNING} [{self.name}] 推送未成功（未配置凭据或发送失败）。")
@@ -673,11 +774,16 @@ class Checker:
             self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
             days_str, status_code = api.get_status(cookie)
             result.days = days_str
+            # fork 定制：get_status 顺手带回了 email / vip，用于通知里的「账号」「套餐」
+            result.email = str(api.profile.get("email") or "")
+            result.plan = plan_name(api.profile.get("vip"))
 
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            result.streak = int(checkin_result.get("streak") or 0)
+            result.message = str(checkin_result.get("message") or "")
 
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
@@ -739,6 +845,10 @@ class Checker:
                 "days": res["days"],
                 "points_total": res["points_total"],
                 "exchange": res["exchange"],
+                "email": res.get("email", ""),
+                "plan": res.get("plan", ""),
+                "streak": res.get("streak", 0),
+                "message": res.get("message", ""),
             })
 
         return {
