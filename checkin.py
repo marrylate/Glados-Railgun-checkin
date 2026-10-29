@@ -230,7 +230,7 @@ class API:
         self.headers: Dict[str, str] = self._get_headers()
         self._device_ua_cache: Dict[str, str] = {}
         # fork 定制：账号画像（get_status 顺手填充），供通知展示 email / 套餐
-        self.profile: Dict[str, object] = {"email": "", "vip": None}
+        self.profile: Dict[str, object] = {"email": "", "vip": None, "expire_at": ""}
         self.session = requests.Session()
         self.session.headers.update(self.headers)
         # 网络抖动时自动重试（指数退避），避免误报失败
@@ -434,6 +434,8 @@ class API:
             # fork 定制：顺带记录账号邮箱与 vip 等级，供 TG 通知展示（不额外发请求）
             self.profile["email"] = info.get("email") or ""
             self.profile["vip"] = info.get("vip", None)
+            # fork 定制：顺带算出套餐到期日（leftDays + 服务端时间反推）
+            self.profile["expire_at"] = _expire_date(left_days, info.get("system_time"))
 
             if left_days is not None:
                 left_days_int = int(float(left_days))
@@ -523,6 +525,7 @@ class CheckinResult:
     plan: str = ""
     streak: int = 0
     message: str = ""
+    expire: str = ""
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
@@ -564,6 +567,32 @@ def _num(text) -> str:
     return m[0] if m else s
 
 
+def _expire_date(left_days, system_time=None) -> str:
+    """fork 定制：由 leftDays（浮点天数）推算套餐到期日（北京时间 YYYY-MM-DD）
+
+    system_time 为 /api/user/status 返回的服务端毫秒时间戳，缺失时用当前时间。
+    接口本身不直接给到期时间戳，只能这样反推。
+    """
+    import datetime
+
+    try:
+        days = float(left_days)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        base = (
+            datetime.datetime.fromtimestamp(int(system_time) / 1000, datetime.timezone.utc)
+            if system_time
+            else datetime.datetime.now(datetime.timezone.utc)
+        )
+    except (TypeError, ValueError, OSError):
+        base = datetime.datetime.now(datetime.timezone.utc)
+    bj = (base + datetime.timedelta(days=days)).astimezone(
+        datetime.timezone(datetime.timedelta(hours=8))
+    )
+    return bj.strftime("%Y-%m-%d")
+
+
 def render_tg(payload: dict) -> str:
     """fork 定制（2026-10-30 用户指定格式）：Telegram「签到通知」频道排版
 
@@ -575,7 +604,8 @@ def render_tg(payload: dict) -> str:
         剩余天数：388 天
         连续签到：2 天
         套餐：Edu
-        时间：2026-10-30 00:20
+        套餐到期：2027-11-21
+        签到时间：2026-10-30 00:20
     """
     now = _bj_now()
     blocks = []
@@ -600,7 +630,9 @@ def render_tg(payload: dict) -> str:
             lines.append(f"连续签到：{r.get('streak', 0)} 天")
         if r.get("plan"):
             lines.append(f"套餐：{r['plan']}")
-        lines.append(f"时间：{now}")
+        if r.get("expire"):
+            lines.append(f"套餐到期：{r['expire']}")
+        lines.append(f"签到时间：{now}")
         blocks.append("\n".join(lines))
     note = payload.get("note")
     if note:
@@ -777,6 +809,7 @@ class Checker:
             # fork 定制：get_status 顺手带回了 email / vip，用于通知里的「账号」「套餐」
             result.email = str(api.profile.get("email") or "")
             result.plan = plan_name(api.profile.get("vip"))
+            result.expire = str(api.profile.get("expire_at") or "")
 
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
@@ -849,6 +882,7 @@ class Checker:
                 "plan": res.get("plan", ""),
                 "streak": res.get("streak", 0),
                 "message": res.get("message", ""),
+                "expire": res.get("expire", ""),
             })
 
         return {
