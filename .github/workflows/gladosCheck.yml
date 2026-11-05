@@ -11,12 +11,17 @@ on:
     # 提交本文件必须使用可关联的账号身份（<ID>+user@users.noreply.github.com），
     # 否则 GitHub 会静默丢弃定时触发（2026-10-08 已踩坑并修复）。
     #
-    # 2026-10-11 精简：主触发交给 Cloudflare Worker（gh-checkin-cron，北京 00:05 准点投递），
-    # 这里只保留 2 个 GitHub 原生兜底点。
-    # 脚本行为（2026-10-11 用户要求）：无论本次是真正签到成功还是「重复运行（今日已签到）」，
-    # 都会推送一条 TG 通知，重复运行的标题标注「🔁 重复运行」以便区分、方便核对。
-    - cron: '35 16 * * *'  # UTC 16:35 = 北京时间 00:35  兜底
-    - cron: '0 10 * * *'   # UTC 10:00 = 北京时间 18:00  兜底
+    # 2026-11-06 重构：GitHub 原生 cron 实测延迟 30 分钟~8 小时、偶尔整天不投递
+    # （2026-11-06 北京 00:05 主触发丢失、00:35 兜底到 01:10 仍未触发 → 静默漏签）。
+    # 改为「一天挂 6 个点」，只要当天任意一次被投递就能签上；
+    # 通知用 actions/cache 做跨运行去重（.tgstate/pushed-YYYY-MM-DD），
+    # 同一天只推第一条，不会因为多点触发而刷屏。
+    - cron: '5 16 * * *'   # 北京 00:05  主（与 Cloudflare Worker 双保险）
+    - cron: '25 16 * * *'  # 北京 00:25
+    - cron: '55 16 * * *'  # 北京 00:55
+    - cron: '30 17 * * *'  # 北京 01:30
+    - cron: '30 19 * * *'  # 北京 03:30
+    - cron: '0 10 * * *'   # 北京 18:00
 
 jobs:
   build:
@@ -38,6 +43,18 @@ jobs:
     steps:
     - name: Checkout Code
       uses: actions/checkout@v6
+
+    # 恢复「今天是否已推送过」标记（跨运行去重，见 tg_notify.pushed_today）
+    - name: Restore push flag
+      uses: actions/cache/restore@v4
+      with:
+        path: .tgstate
+        key: tgpush-${{ github.run_id }}
+        restore-keys: |
+          tgpush-
+
+    - name: Prepare state dir
+      run: mkdir -p .tgstate
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6
@@ -68,6 +85,15 @@ jobs:
         TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
         TG_NOTIFY_CHANNEL_ID: ${{ secrets.TG_NOTIFY_CHANNEL_ID }}
         TG_NOTIFY_CHANNEL_HASH: ${{ secrets.TG_NOTIFY_CHANNEL_HASH }}
+        TG_STATE_DIR: ${{ github.workspace }}/.tgstate
+
+    # 保存「今天已推送」标记，供后续兜底 cron 点判断是否还要推
+    - name: Save push flag
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: .tgstate
+        key: tgpush-${{ github.run_id }}
 
     # 兜底通知：签到脚本已成功推送则静默跳过；脚本秒退/崩溃时补一条告警
     - name: Fallback Telegram notify
@@ -80,6 +106,7 @@ jobs:
         TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
         TG_NOTIFY_CHANNEL_ID: ${{ secrets.TG_NOTIFY_CHANNEL_ID }}
         TG_NOTIFY_CHANNEL_HASH: ${{ secrets.TG_NOTIFY_CHANNEL_HASH }}
+        TG_STATE_DIR: ${{ github.workspace }}/.tgstate
 
     - name: Keep alive
       uses: liskin/gh-workflow-keepalive@v1

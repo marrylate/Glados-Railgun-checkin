@@ -82,6 +82,47 @@ def already_pushed():
 
 
 # --------------------------------------------------------------------------- #
+# 跨运行去重（2026-11-06 新增）
+# --------------------------------------------------------------------------- #
+#  背景：GitHub 原生定时触发会延迟甚至丢弃，所以一天挂了多个 cron 兜底点。
+#        多点必然导致重复推送，因此在仓库内用 actions/cache 持久化一个
+#        「今天已推送」标记（TG_STATE_DIR 指向被 restore/save 的目录），
+#        同一天只允许推第一条通知。
+# --------------------------------------------------------------------------- #
+def _bj_today():
+    import datetime
+
+    bj = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+    return bj.strftime("%Y-%m-%d")
+
+
+def _state_dir():
+    return _env("TG_STATE_DIR") or (tempfile.gettempdir() + os.sep + "tg_state")
+
+
+def _daily_flag_path():
+    return os.path.join(_state_dir(), "pushed-%s" % _bj_today())
+
+
+def pushed_today():
+    """今天（北京日期）是否已经推送过通知"""
+    try:
+        return os.path.exists(_daily_flag_path())
+    except Exception:
+        return False
+
+
+def mark_pushed_today():
+    try:
+        d = _state_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(_daily_flag_path(), "w", encoding="utf-8") as f:
+            f.write(_bj_today())
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # 发送
 # --------------------------------------------------------------------------- #
 def _proxy():
@@ -177,6 +218,7 @@ def push_checkin_to_telegram(title, content):
     ok = send_message(text)
     if ok:
         mark_pushed()
+        mark_pushed_today()
     return ok
 
 
@@ -190,6 +232,7 @@ def push_plain_text(text):
     ok = send_message(body)
     if ok:
         mark_pushed()
+        mark_pushed_today()
     return ok
 
 
@@ -202,8 +245,8 @@ def _main(argv):
         rest = argv[idx + 1:]
         title = rest[0] if rest else "GLaDOS 签到异常"
         body = rest[1] if len(rest) > 1 else ""
-        if already_pushed():
-            print("[tg] 签到脚本已自行推送过，跳过兜底通知", flush=True)
+        if already_pushed() or pushed_today():
+            print("[tg] 签到脚本已自行推送过（或今日通知已发），跳过兜底通知", flush=True)
             return 0
         url = run_url()
         if not body:

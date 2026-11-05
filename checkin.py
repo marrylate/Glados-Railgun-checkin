@@ -14,10 +14,17 @@ from logging_config import init_logger
 
 # ---- Telegram 推送（fork 定制，2026-10-07）----
 try:
-    from tg_notify import push_checkin_to_telegram, push_plain_text
+    from tg_notify import (
+        mark_pushed,
+        push_checkin_to_telegram,
+        push_plain_text,
+        pushed_today,
+    )
 except Exception:  # 模块缺失时不阻塞签到主流程
     push_checkin_to_telegram = None
     push_plain_text = None
+    pushed_today = None
+    mark_pushed = None
 
 
 class CheckinStatus(Enum):
@@ -713,6 +720,16 @@ class TelegramBackend(PushBackend):
         if push_checkin_to_telegram is None:
             logger.warning(f"{LogEmoji.WARNING} [{self.name}] tg_notify 模块不可用，跳过 Telegram 推送。")
             return False
+        # fork 定制（2026-11-06）：同一天只推第一条，避免多个兜底 cron 点重复刷屏
+        try:
+            if pushed_today is not None and pushed_today():
+                logger.info(f"{LogEmoji.INFO} [{self.name}] 今天已推送过签到通知，本次跳过（多点兜底去重）。")
+                # 同时打上本次运行的已推送标记，避免 workflow 的兜底通知再补一条
+                if mark_pushed is not None:
+                    mark_pushed()
+                return False
+        except Exception:
+            pass
         try:
             # fork 定制：TG 用固定字段排版（render_tg），不再复用 PushDeer 的单行格式
             if push_plain_text is not None:
@@ -755,7 +772,7 @@ class PushService:
         if any(results):
             logger.info(f"{LogEmoji.SUCCESS} 发送完成：{sum(results)}/{len(results)} 个后端成功")
             return True
-        logger.error(f"{LogEmoji.ERROR} 全部后端发送失败")
+        logger.warning(f"{LogEmoji.WARNING} 本次未成功推送（今日已推送过去重，或后端未配置）")
         return False
 
 
