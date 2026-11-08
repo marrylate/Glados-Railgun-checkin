@@ -480,6 +480,56 @@ class API:
             return "None 积分", 0
 
     @log_method
+    def has_checked_in_today(self, cookies: str) -> Tuple[bool, int, str, int]:
+        """查积分明细里今天（北京日期）是否已有 system:checkin 记录。
+
+        fork 定制（2026-11-08）：一天有多个定时触发点，已签到就**不再调用签到接口**，
+        只发只读 GET，避免反复 POST /user/checkin 触发平台风控。
+
+        返回 (今日已签到, 总积分, 总积分文本, 连续签到天数)
+        """
+        url = self._get_full_url(self.POINTS_URL)
+        response = self._make_request(url, "GET", cookies=cookies)
+
+        # 查询失败时一律按「未签到」处理：宁可多签一次（服务端会返回重复，无副作用），
+        # 也不能因为只读接口抖动就漏签。
+        if not response:
+            return False, 0, "None 积分", 0
+
+        data = response.json()
+        if data.get("code", -2) != 0:
+            return False, 0, "None 积分", 0
+
+        try:
+            total = int(float(data.get("points") or 0))
+        except (TypeError, ValueError):
+            total = 0
+
+        dates = {
+            str(it.get("detail") or "")
+            for it in (data.get("history") or [])
+            if it.get("business") == "system:checkin"
+        }
+        today = _bj_date()
+        already = today in dates
+
+        # 从今天往前数连续签到天数（明细里的 detail 是北京日期）
+        import datetime
+
+        streak = 0
+        cursor = datetime.date.fromisoformat(today)
+        while cursor.isoformat() in dates:
+            streak += 1
+            cursor -= datetime.timedelta(days=1)
+
+        points_str = f"{total} 积分"
+        if already:
+            self._log("info", LogEmoji.SUCCESS, f"{{ 今日(北京)已有签到记录，连续 {streak} 天 }}")
+        else:
+            self._log("info", LogEmoji.INFO, "{ 今日(北京)尚无签到记录 }")
+        return already, total, points_str, streak
+
+    @log_method
     def exchange(self, cookies: str, plan: str, required_points: int) -> str:
         """执行兑换"""
         url = self._get_full_url(self.EXCHANGE_URL)
@@ -565,6 +615,14 @@ def _bj_now() -> str:
     return bj.strftime("%Y-%m-%d %H:%M")
 
 
+def _bj_date() -> str:
+    """北京时间日期 YYYY-MM-DD（GLaDOS 积分明细的 detail 字段用的就是北京日期）"""
+    import datetime
+
+    bj = datetime.datetime.now(datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+    return bj.strftime("%Y-%m-%d")
+
+
 def _num(text) -> str:
     """从 '303 积分' / '388 天' 取数字；含 None 的脏值返回 '未知'"""
     s = str(text or "")
@@ -627,13 +685,15 @@ def render_tg(payload: dict) -> str:
             lines.append(f"今日：+{_num(r.get('points'))} 分（日历已打卡）")
         elif status == "重复签到":
             lines.append("今日：+0 分（今日已签到）")
+        elif status == "今日已签到，跳过":
+            lines.append("今日：已签到（本次未重复请求）")
         if r.get("points_total"):
             total = _num(r.get("points_total"))
             lines.append("积分：未知" if total == "未知" else f"积分：{total}")
         if r.get("days"):
             days = _num(r.get("days"))
             lines.append("剩余天数：未知" if days == "未知" else f"剩余天数：{days} 天")
-        if status in ("签到成功", "重复签到"):
+        if status in ("签到成功", "重复签到", "今日已签到，跳过"):
             lines.append(f"连续签到：{r.get('streak', 0)} 天")
         if r.get("plan"):
             lines.append(f"套餐：{r['plan']}")
@@ -828,16 +888,36 @@ class Checker:
             result.plan = plan_name(api.profile.get("vip"))
             result.expire = str(api.profile.get("expire_at") or "")
 
-            self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
-            checkin_result = api.checkin(cookie)
-            result.status = checkin_result["status"]
-            result.code = checkin_result.get("code", CheckinStatus.FAILURE)
-            result.streak = int(checkin_result.get("streak") or 0)
-            result.message = str(checkin_result.get("message") or "")
+            self._log(cookie_idx, domain, LogEmoji.CHECKIN, "检查今日签到状态")
+            # fork 定制（2026-11-08 用户要求）：已签到就不再 POST 签到接口，
+            # 一天里的其余定时点只做只读查询，避免重复请求触发平台风控。
+            already, points_num, points_str, streak = api.has_checked_in_today(cookie)
 
-            self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
-            points_str, points_num = api.get_points(cookie)
-            result.points_total = points_str
+            if already:
+                result.status = "今日已签到，跳过"
+                result.code = CheckinStatus.REPEAT
+                result.points = "0"
+                result.streak = streak
+                result.message = "今日已有签到记录，未重复调用签到接口"
+                result.points_total = points_str
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.REPEAT,
+                    "今日已签到 → 跳过签到请求（仅只读查询，未触发 POST）",
+                    force=True,
+                )
+            else:
+                self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
+                checkin_result = api.checkin(cookie)
+                result.status = checkin_result["status"]
+                result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+                result.streak = int(checkin_result.get("streak") or 0)
+                result.message = str(checkin_result.get("message") or "")
+
+                self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
+                points_str, points_num = api.get_points(cookie)
+                result.points_total = points_str
 
             # fork 定制：积分不足时也跳过兑换，避免无谓请求
             if self.config.exchange_plan in self.config.EXCHANGE_PLANS:
