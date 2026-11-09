@@ -3,7 +3,8 @@ name: GLaDOS Check-in
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    # 2026-11-10 修正：仓库默认分支是 master，原来只写 main，导致手动 push 永远不触发运行
+    branches: [ master, main ]
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
