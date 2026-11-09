@@ -17,6 +17,8 @@ from logging_config import init_logger
 # ---- Telegram 推送（fork 定制，2026-10-07）----
 try:
     from tg_notify import (
+        checkin_done_today,
+        mark_checkin_done,
         mark_pushed,
         push_checkin_to_telegram,
         push_plain_text,
@@ -27,6 +29,8 @@ except Exception:  # 模块缺失时不阻塞签到主流程
     push_plain_text = None
     pushed_today = None
     mark_pushed = None
+    checkin_done_today = None
+    mark_checkin_done = None
 
 
 class CheckinStatus(Enum):
@@ -1089,6 +1093,18 @@ def main():
     """主函数"""
     exit_code = 0
     config = None
+
+    # 2026-11-10 用户要求：只要今天签到成功过（已推送过 TG），后面所有兜底触发点
+    # 进来就直接退出 —— 不登录、不查状态、不 POST 签到接口、不连 TG，
+    # 避免一天 6 个 cron 点反复打签到接口把账号搞进风控。
+    # 只有当天还没签成功（失败 / 没跑过）才会往下执行。
+    # 需要强制重跑时加环境变量 GLADOS_FORCE=1（手动排查用）。
+    force = (os.environ.get("GLADOS_FORCE") or "").strip() in ("1", "true", "yes")
+    if not force and checkin_done_today and checkin_done_today():
+        logger.info(f"{LogEmoji.INFO} 今日已签到成功（状态标记存在），本次不发起任何请求，直接退出")
+        logger.info(f"{LogEmoji.END} 签到完成（跳过：今日已成功）")
+        return
+
     try:
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
         config = Config()
@@ -1117,6 +1133,16 @@ def main():
                 logger.info(f"{LogEmoji.INFO} 本次全部为「重复签到」，按用户要求仍推送通知（标注为重复运行）。")
 
             logger.info(f"\n{LogEmoji.END} ========== 签到总结 ==========\n{payload['title']}\n{render_payload(payload)}")
+
+            # 2026-11-10 用户要求：今天已经签成功（或服务端显示已签到）就写「今日已完成」标记。
+            # 后面的兜底 cron 点读到标记就直接退出，不再打接口；只要有失败就不写，
+            # 保持「没成功就继续补签」的行为。
+            if mark_checkin_done:
+                if payload.get("fail", 0) == 0 and (payload.get("success", 0) + payload.get("repeat", 0)) > 0:
+                    mark_checkin_done()
+                    logger.info(f"{LogEmoji.SUCCESS} 今日签到已完成，已写入完成标记（后续触发点将直接退出，不再请求签到接口）")
+                else:
+                    logger.info(f"{LogEmoji.WARNING} 本次仍有失败任务，不写完成标记，后续触发点会继续补签")
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")

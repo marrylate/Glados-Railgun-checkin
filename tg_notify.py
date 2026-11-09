@@ -123,6 +123,38 @@ def mark_pushed_today():
 
 
 # --------------------------------------------------------------------------- #
+# 「今日已签到成功」标记（2026-11-10 用户要求）
+#
+#   用户原话：「只要签到成功了，就不要再签到再去触发了……就算你不推送，也不要
+#   在后台继续签到，等一下把我号搞封了……除非是没有签到成功的。」
+#
+#   一天挂了 6 个 cron 点，第一次签成功后写这个标记（和推送标记同一个持久化目录，
+#   靠 actions/cache 跨运行保留），后面几个点进来直接退出：不登录、不查状态、
+#   不 POST 签到接口、不连 TG。只有当天还没签成功（失败/没跑过）才会真正执行。
+# --------------------------------------------------------------------------- #
+def _checkin_done_flag_path():
+    return os.path.join(_state_dir(), "checkin-done-%s" % _bj_today())
+
+
+def checkin_done_today():
+    """今天（北京日期）是否已经签到成功过"""
+    try:
+        return os.path.exists(_checkin_done_flag_path())
+    except Exception:
+        return False
+
+
+def mark_checkin_done():
+    try:
+        d = _state_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(_checkin_done_flag_path(), "w", encoding="utf-8") as f:
+            f.write(_bj_today())
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # 发送
 # --------------------------------------------------------------------------- #
 def _proxy():
@@ -245,8 +277,8 @@ def _main(argv):
         rest = argv[idx + 1:]
         title = rest[0] if rest else "GLaDOS 签到异常"
         body = rest[1] if len(rest) > 1 else ""
-        if already_pushed() or pushed_today():
-            print("[tg] 签到脚本已自行推送过（或今日通知已发），跳过兜底通知", flush=True)
+        if already_pushed() or pushed_today() or checkin_done_today():
+            print("[tg] 签到脚本已自行推送过（或今日通知已发/今日已签到成功），跳过兜底通知", flush=True)
             return 0
         url = run_url()
         if not body:
