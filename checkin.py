@@ -1,6 +1,8 @@
+import hashlib
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -47,6 +49,7 @@ class APIEndpoint(Enum):
     """API端点"""
 
     CHECKIN = "/api/user/checkin"
+    CHECKIN_CHALLENGE = "/api/user/checkin/challenge"
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
     EXCHANGE = "/api/user/exchange"
@@ -221,6 +224,17 @@ PLATFORM_UA = {
     "Android": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 }
 
+"""签到 challenge 的 proof 后缀与提交前最小等待（与 GLaDOS 网页端当前实现一致）"""
+CHALLENGE_SUFFIX = "glados-observe-v1"
+CHALLENGE_DELAY_SECONDS = 2.5
+
+"""自定义 User-Agent（2026-11 合并上游 b9d4a91b）
+
+GLaDOS 会校验 UA 与账号登录设备，不一致时签到被拒（code 4 / device-mismatch）。
+填写「提取 Cookie 时那个浏览器」的 UA 最稳；留空则用默认 UA + loginDevice 自适应重试。
+"""
+ENV_USER_AGENT = "GLADOS_USER_AGENT"
+
 
 class API:
     """API 调用"""
@@ -230,10 +244,13 @@ class API:
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
 
-    def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False):
+    def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False, user_agent: Optional[str] = None):
         self.domain: str = domain
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
+        # 合并上游 b9d4a91b：自定义 UA 优先，其次环境变量，都没有则留空（走平台默认 + 自适应重试）
+        env_ua = (os.environ.get(ENV_USER_AGENT) or "").strip()
+        self.user_agent: str = (user_agent or env_ua or "").strip()
         self.headers: Dict[str, str] = self._get_headers()
         self._device_ua_cache: Dict[str, str] = {}
         # fork 定制：账号画像（get_status 顺手填充），供通知展示 email / 套餐
@@ -275,9 +292,10 @@ class API:
 
     def _get_headers(self) -> Dict[str, str]:
         """获取请求头"""
+        base_ua = getattr(self, "user_agent", "") or PLATFORM_UA["Windows"]
         return {
             "origin": f"https://{self.domain}",
-            "user-agent": PLATFORM_UA["Windows"],
+            "user-agent": base_ua,
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
@@ -298,8 +316,12 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
-        """发送 HTTP 请求"""
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None, json_body: bool = False) -> Optional[requests.Response]:
+        """发送 HTTP 请求
+
+        json_body=True 时以 JSON 提交（新版签到带 challenge 时服务端要求 JSON body，
+        老版表单提交会被当成旧协议 → 只给 1 积分）。
+        """
         session_headers = self.headers.copy()
         if user_agent:
             session_headers["user-agent"] = user_agent
@@ -307,7 +329,10 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                if json_body:
+                    response = self.session.post(url, headers=session_headers, json=data, timeout=(60, 120))
+                else:
+                    response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
             elif method.upper() == "GET":
                 response = self.session.get(url, headers=session_headers, timeout=(60, 120))
             else:
@@ -325,6 +350,39 @@ class API:
     def _get_checkin_data(self) -> Dict[str, str]:
         """获取签到数据"""
         return {"token": self.domain}
+
+    def _get_checkin_challenge(self, cookies: str, user_agent: Optional[str] = None) -> Optional[Tuple[str, str]]:
+        """获取签到 challenge 并计算 proof（合并上游 7bdf8225）
+
+        GLaDOS 新版签到要求带 challenge 提交；拿不到就回退旧协议，
+        但旧协议服务端判定为自动签到，只给 1 积分、连续天数不累加。
+        失败返回 None，由调用方回退。
+        """
+        url = self._get_full_url(APIEndpoint.CHECKIN_CHALLENGE.value)
+        response = self._make_request(url, "GET", cookies=cookies, user_agent=user_agent)
+        if not response:
+            return None
+
+        try:
+            data = response.json()
+        except ValueError:
+            self._log("warning", LogEmoji.WARNING, "签到 challenge 响应解析失败，按旧协议提交", force=True)
+            return None
+
+        if not isinstance(data, dict) or data.get("code") != 0:
+            self._log("warning", LogEmoji.WARNING, f"签到 challenge 响应异常: {data}", force=True)
+            return None
+
+        nonce = data.get("nonce")
+        if not nonce:
+            self._log("warning", LogEmoji.WARNING, "签到 challenge 缺少 nonce，按旧协议提交", force=True)
+            return None
+
+        # 与网页端一致：拿到 challenge 后等待一小段再提交，太快会被判定为脚本
+        time.sleep(CHALLENGE_DELAY_SECONDS)
+        proof = hashlib.sha256(f"{nonce}.{CHALLENGE_SUFFIX}".encode()).hexdigest()
+        self._log("info", LogEmoji.SUCCESS, "已获取签到 challenge", force=True)
+        return str(nonce), proof
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
@@ -348,8 +406,33 @@ class API:
         return self._parse_checkin(raw)
 
     def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
-        """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
-        response = self._make_request(url, "POST", data, cookies, user_agent=user_agent)
+        """发起一次签到请求并返回解析后的响应体（失败返回 None）
+
+        合并上游 7bdf8225：先取 challenge，拿到就带 nonce/proof 且用 JSON 提交；
+        拿不到回退旧表单提交（服务端仍放行，但只给 1 积分）。
+        """
+        payload: Dict[str, str] = dict(data or {})
+        challenge = self._get_checkin_challenge(cookies, user_agent)
+        if challenge:
+            nonce, proof = challenge
+            payload["nonce"] = nonce
+            payload["proof"] = proof
+        else:
+            self._log(
+                "warning",
+                LogEmoji.WARNING,
+                "未取得签到 challenge，按旧协议提交（只给 1 积分、不计连续签到）",
+                force=True,
+            )
+
+        response = self._make_request(
+            url,
+            "POST",
+            payload,
+            cookies,
+            user_agent=user_agent,
+            json_body=bool(challenge),
+        )
         if not response:
             return None
         try:
@@ -505,11 +588,17 @@ class API:
         except (TypeError, ValueError):
             total = 0
 
-        dates = {
-            str(it.get("detail") or "")
-            for it in (data.get("history") or [])
-            if it.get("business") == "system:checkin"
-        }
+        # 2026-11-10 修复：原来严格匹配 business == "system:checkin"，
+        # 服务端字段写法一变就会「每天都判定未签到」→ 一天 6 个触发点全部真 POST，
+        # 既刷积分记录也容易吃风控。改为包含匹配 + detail 取日期前缀。
+        dates = set()
+        for it in data.get("history") or []:
+            biz = str(it.get("business") or "").lower()
+            if "checkin" not in biz:
+                continue
+            day = str(it.get("detail") or "")[:10]
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                dates.add(day)
         today = _bj_date()
         already = today in dates
 
@@ -914,6 +1003,8 @@ class Checker:
                 result.code = checkin_result.get("code", CheckinStatus.FAILURE)
                 result.streak = int(checkin_result.get("streak") or 0)
                 result.message = str(checkin_result.get("message") or "")
+                # 2026-11-10 修复：原来这里没回填 points，通知里永远显示「今日：+0 分」
+                result.points = str(checkin_result.get("points") or "0")
 
                 self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
                 points_str, points_num = api.get_points(cookie)
