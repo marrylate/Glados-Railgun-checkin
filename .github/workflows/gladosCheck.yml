@@ -97,6 +97,13 @@ jobs:
         GLADOS_CABLE_MIN: '7'
         # 北京时间几点之后不再挑档位、无条件签（保连续签到天数）
         GLADOS_CABLE_FALLBACK_HOUR: '20'
+        # ---- Cloudflare Turnstile 打码（2026-11-14）----
+        # GLaDOS 签到新增 Turnstile：token 只能由真浏览器拿，云端 runner 拿不到
+        # （实测要求人工交互、连 iframe 都不建）。想在云端签，只能把过验证外包给打码平台。
+        # 在仓库 Secrets 里加 SOLVER_API_KEY 即自动启用（默认 capsolver）；
+        # 不配则遇到验证时跳过、不误报，由本机浏览器脚本补签。
+        GLADOS_SOLVER: ${{ secrets.GLADOS_SOLVER }}
+        SOLVER_API_KEY: ${{ secrets.SOLVER_API_KEY }}
         # ---- Telegram 推送（新增 2026-10-07）----
         TG_API_ID: ${{ secrets.TG_API_ID }}
         TG_API_HASH: ${{ secrets.TG_API_HASH }}

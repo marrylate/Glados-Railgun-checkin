@@ -136,6 +136,14 @@ class Config:
     #   Cable 按 China Network Insight 指数分档（<90→9、90-94→7、95-99→5、
     #   100-109→3、110-130→2、>130→1），线路越差给得越多。
     #   所以签到前先探当前档位，档位不够就先不签，留到下一个 cron 点再探。
+    # 2026-11-14 新增：Cloudflare Turnstile 打码服务（云端签到唯一可行路径）
+    #   GLaDOS 签到加了 Turnstile：token 只能由真浏览器拿。GitHub Actions 上实测
+    #   Turnstile 直接判「需要人工交互」且不建 iframe，云端自己算不出来；
+    #   唯一能把签到留在云端的办法是把这一小步外包给打码平台。
+    #   配置 SOLVER_API_KEY 即自动启用（默认 capsolver），不配就回到「交本机处理」。
+    ENV_SOLVER = "GLADOS_SOLVER"          # capsolver / 2captcha（留空自动判断）
+    ENV_SOLVER_KEY = "SOLVER_API_KEY"     # 打码平台 API key
+
     ENV_CABLE_MODE = "GLADOS_CABLE_MODE"
     ENV_CABLE_MIN = "GLADOS_CABLE_MIN"
     ENV_CABLE_FALLBACK_HOUR = "GLADOS_CABLE_FALLBACK_HOUR"
@@ -177,6 +185,8 @@ class Config:
         self.cable_mode: bool = self.DEFAULT_CABLE_MODE
         self.cable_min: int = self.DEFAULT_CABLE_MIN
         self.cable_fallback_hour: int = self.DEFAULT_CABLE_FALLBACK_HOUR
+        self.solver_provider: str = ""
+        self.solver_key: str = ""
         self._load_config()
 
     def _load_config(self) -> None:
@@ -228,6 +238,17 @@ class Config:
         else:
             self.DOMAINS = list(self.DEFAULT_DOMAINS)
         logger.info(f"{LogEmoji.INFO} 签到域名: {', '.join(self.DOMAINS)}")
+
+        # 打码服务（Turnstile）
+        self.solver_provider = (os.environ.get(self.ENV_SOLVER) or "").strip().lower()
+        self.solver_key = (os.environ.get(self.ENV_SOLVER_KEY) or "").strip()
+        if self.solver_key and not self.solver_provider:
+            self.solver_provider = "capsolver"
+        if self.solver_key:
+            logger.info(f"{LogEmoji.SUCCESS} Turnstile 打码服务已启用：{self.solver_provider}")
+        else:
+            logger.info(f"{LogEmoji.INFO} 未配置 {self.ENV_SOLVER_KEY}，遇到 Turnstile 将跳过（交本机浏览器签到）。")
+        self.solver = TurnstileSolver(self.solver_provider, self.solver_key, verbose=self.verbose)
 
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}，{self.ENV_SERVERCHAN_KEY} {'已设置' if serverchan_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
@@ -304,6 +325,129 @@ GLaDOS 会校验 UA 与账号登录设备，不一致时签到被拒（code 4 / 
 ENV_USER_AGENT = "GLADOS_USER_AGENT"
 
 
+class TurnstileSolver:
+    """Cloudflare Turnstile 打码封装（2026-11-14）
+
+    GLaDOS 给签到 /api/user/checkin 加了 Turnstile：challenge 响应里带 sitekey，
+    提交必须带真实 token，否则回 {"code":5,"reason":"turnstile"}。
+    实测结论：
+      - 纯 HTTP：无解；
+      - 无头浏览器（含 xvfb 有头 Chromium，在 GitHub Actions 上）：Turnstile 判
+        「需要人工交互」，连验证 iframe 都不建，拿不到 token；
+      - 本机真浏览器：15s 出 token（所以本机脚本能签）。
+    因此想让签到继续跑在云端，只能把「过验证」这一小步外包给打码平台：
+    云端拿到 token 后仍由 Actions 自己 POST，积分/流水/通知全保持原样。
+    """
+
+    CAPSOLVER_CREATE = "https://api.capsolver.com/createTask"
+    CAPSOLVER_RESULT = "https://api.capsolver.com/getTaskResult"
+    TWOCAPTCHA_IN = "https://2captcha.com/in.php"
+    TWOCAPTCHA_RES = "https://2captcha.com/res.php"
+
+    def __init__(self, provider: str = "", api_key: str = "", verbose: bool = False):
+        self.provider = (provider or "").strip().lower()
+        self.api_key = (api_key or "").strip()
+        self.verbose = verbose
+        if not self.provider and self.api_key:
+            self.provider = "capsolver"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key) and self.provider in ("capsolver", "2captcha")
+
+    def solve(
+        self, sitekey: str, page_url: str, action: str = "checkin", cdata: str = "", timeout: int = 120
+    ) -> Optional[str]:
+        """返回 Turnstile token；失败返回 None（不抛异常，主流程走跳过分支）"""
+        if not self.enabled:
+            return None
+        try:
+            if self.provider == "capsolver":
+                return self._capsolver(sitekey, page_url, action, cdata, timeout)
+            return self._two_captcha(sitekey, page_url, action, cdata, timeout)
+        except Exception as e:
+            logger.warning(f"{LogEmoji.WARNING} 打码服务调用异常：{e}")
+            return None
+
+    def _capsolver(self, sitekey: str, page_url: str, action: str, cdata: str, timeout: int) -> Optional[str]:
+        task: Dict[str, object] = {
+            "type": "AntiTurnstileTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": sitekey,
+        }
+        meta: Dict[str, str] = {}
+        if action:
+            meta["action"] = action
+        if cdata:
+            meta["cdata"] = cdata
+        if meta:
+            task["metadata"] = meta
+
+        logger.info(f"{LogEmoji.INFO} 提交 Turnstile 打码任务（capsolver）…")
+        resp = requests.post(
+            self.CAPSOLVER_CREATE, json={"clientKey": self.api_key, "task": task}, timeout=30
+        ).json()
+        if resp.get("errorId"):
+            logger.warning(
+                f"{LogEmoji.WARNING} 打码任务创建失败：{resp.get('errorCode')} {resp.get('errorDescription')}"
+            )
+            return None
+        task_id = resp.get("taskId")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(3)
+            r = requests.post(
+                self.CAPSOLVER_RESULT, json={"clientKey": self.api_key, "taskId": task_id}, timeout=30
+            ).json()
+            if r.get("errorId"):
+                logger.warning(
+                    f"{LogEmoji.WARNING} 打码结果查询失败：{r.get('errorCode')} {r.get('errorDescription')}"
+                )
+                return None
+            if r.get("status") == "ready":
+                token = (r.get("solution") or {}).get("token")
+                if token:
+                    logger.info(f"{LogEmoji.SUCCESS} 打码完成，已拿到 Turnstile token")
+                return token
+        logger.warning(f"{LogEmoji.WARNING} 打码超时（{timeout}s）")
+        return None
+
+    def _two_captcha(self, sitekey: str, page_url: str, action: str, cdata: str, timeout: int) -> Optional[str]:
+        data = {
+            "method": "turnstile",
+            "key": self.api_key,
+            "sitekey": sitekey,
+            "pageurl": page_url,
+            "json": 1,
+        }
+        if action:
+            data["action"] = action
+        if cdata:
+            data["data"] = cdata
+        logger.info(f"{LogEmoji.INFO} 提交 Turnstile 打码任务（2captcha）…")
+        resp = requests.post(self.TWOCAPTCHA_IN, data=data, timeout=30).json()
+        if resp.get("status") != 1:
+            logger.warning(f"{LogEmoji.WARNING} 打码任务创建失败：{resp.get('request')}")
+            return None
+        task_id = resp.get("request")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(5)
+            r = requests.get(
+                self.TWOCAPTCHA_RES,
+                params={"key": self.api_key, "action": "get", "id": task_id, "json": 1},
+                timeout=30,
+            ).json()
+            if r.get("status") == 1:
+                logger.info(f"{LogEmoji.SUCCESS} 打码完成，已拿到 Turnstile token")
+                return r.get("request")
+            if r.get("request") != "CAPCHA_NOT_READY":
+                logger.warning(f"{LogEmoji.WARNING} 打码失败：{r.get('request')}")
+                return None
+        logger.warning(f"{LogEmoji.WARNING} 打码超时（{timeout}s）")
+        return None
+
+
 class API:
     """API 调用"""
 
@@ -321,6 +465,12 @@ class API:
         self.user_agent: str = (user_agent or env_ua or "").strip()
         self.headers: Dict[str, str] = self._get_headers()
         self._device_ua_cache: Dict[str, str] = {}
+        # 2026-11-14：Turnstile 打码（由 main 注入；未配置则为 None → 跳过签到）
+        self.solver: Optional["TurnstileSolver"] = None
+        self._need_turnstile: bool = False
+        self._ts_sitekey: str = ""
+        self._ts_nonce: str = ""
+        self._ts_page_url: str = ""
         # fork 定制：账号画像（get_status 顺手填充），供通知展示 email / 套餐
         self.profile: Dict[str, object] = {"email": "", "vip": None, "expire_at": ""}
         self.session = requests.Session()
@@ -452,10 +602,13 @@ class API:
         # 所以这里直接不打签到接口，标记「需浏览器」交给本机脚本补签，避免每天刷失败。
         if data.get("turnstile"):
             self._need_turnstile = True
+            self._ts_sitekey = str(data.get("turnstile") or "")
+            self._ts_nonce = str(nonce)
+            self._ts_page_url = f"https://{self.domain}/console/checkin"
             self._log(
                 "warning",
                 LogEmoji.PENDING,
-                "服务端要求 Cloudflare Turnstile 验证（challenge 带 sitekey），HTTP 脚本无法通过，本次跳过 → 本机浏览器签到",
+                f"服务端要求 Cloudflare Turnstile 验证（sitekey={self._ts_sitekey}）",
                 force=True,
             )
             return None
@@ -497,12 +650,32 @@ class API:
         self._need_turnstile = False
         challenge = self._get_checkin_challenge(cookies, user_agent)
         if getattr(self, "_need_turnstile", False):
-            # 交给 _parse_checkin 归类成「待浏览器验证」（非失败），不推送
-            return {
-                "code": 5,
-                "reason": "turnstile",
-                "message": "服务端要求 Cloudflare 浏览器验证，本机浏览器脚本已接管",
-            }
+            # 服务端要 Turnstile token。配了打码服务就让它算，算不到再跳过
+            # （跳过交给 _parse_checkin 归类成「待处理」，既不算失败也不推送）。
+            token = None
+            if self.solver is not None and self.solver.enabled:
+                token = self.solver.solve(
+                    sitekey=self._ts_sitekey,
+                    page_url=self._ts_page_url,
+                    action="checkin",
+                    cdata=self._ts_nonce,
+                )
+            if not token:
+                return {
+                    "code": 5,
+                    "reason": "turnstile",
+                    "message": (
+                        "服务端要求 Cloudflare Turnstile，且未配置/未取到打码 token"
+                        if self.solver is None or not self.solver.enabled
+                        else "服务端要求 Cloudflare Turnstile，打码服务未返回 token"
+                    ),
+                }
+            nonce = self._ts_nonce
+            payload["nonce"] = nonce
+            payload["proof"] = hashlib.sha256(f"{nonce}.{CHALLENGE_SUFFIX}".encode()).hexdigest()
+            payload["tsState"] = "ok"
+            payload["turnstile"] = token
+            challenge = (nonce, payload["proof"])
         if challenge:
             nonce, proof = challenge
             payload["nonce"] = nonce
@@ -1265,6 +1438,8 @@ class Checker:
         result = CheckinResult(cookie_idx, domain)
 
         with API(domain, cookie_idx, verbose=self.config.verbose) as api:
+            # 2026-11-14：Turnstile 打码服务（未配置时 None → 遇到验证就跳过）
+            api.solver = getattr(self.config, "solver", None)
             self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
             days_str, status_code = api.get_status(cookie)
             result.days = days_str
