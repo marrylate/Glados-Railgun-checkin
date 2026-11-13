@@ -137,20 +137,24 @@ def main():
                     clicked += 1
                     ok = False
                     try:
-                        frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+                        frame = page.frame_locator("#gl-ts-box iframe")
                         frame.locator('input[type="checkbox"]').first.click(timeout=4000)
                         ok = True
                         out["click_mode"] = "checkbox"
-                    except Exception:
+                    except Exception as e1:
+                        out["click_err1"] = str(e1)[:120]
                         try:
-                            el = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+                            el = page.query_selector("#gl-ts-box iframe") or page.query_selector(
+                                'iframe[src*="challenges.cloudflare.com"]'
+                            )
                             box = el.bounding_box() if el else None
+                            out["iframe_box"] = box
                             if box:
                                 page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
                                 ok = True
                                 out["click_mode"] = "coord"
-                        except Exception:
-                            pass
+                        except Exception as e2:
+                            out["click_err2"] = str(e2)[:120]
                     out["clicks"] = clicked
                     out["click_ok"] = ok
                     page.wait_for_timeout(3000)
