@@ -12,17 +12,17 @@ on:
     # 提交本文件必须使用可关联的账号身份（<ID>+user@users.noreply.github.com），
     # 否则 GitHub 会静默丢弃定时触发（2026-10-08 已踩坑并修复）。
     #
-    # 2026-11-06 重构：GitHub 原生 cron 实测延迟 30 分钟~8 小时、偶尔整天不投递
+    # 2026-11-06：GitHub 原生 cron 实测延迟 30 分钟~8 小时、偶尔整天不投递
     # （2026-11-06 北京 00:05 主触发丢失、00:35 兜底到 01:10 仍未触发 → 静默漏签）。
-    # 改为「一天挂 6 个点」，只要当天任意一次被投递就能签上；
+    # 所以一天挂多个点，只要当天任意一次被投递就能签上；
     # 通知用 actions/cache 做跨运行去重（.tgstate/pushed-YYYY-MM-DD），
     # 同一天只推第一条，不会因为多点触发而刷屏。
-    - cron: '5 16 * * *'   # 北京 00:05  主（与 Cloudflare Worker 双保险）
-    - cron: '25 16 * * *'  # 北京 00:25
-    - cron: '55 16 * * *'  # 北京 00:55
-    - cron: '30 17 * * *'  # 北京 01:30
-    - cron: '30 19 * * *'  # 北京 03:30
-    - cron: '0 10 * * *'   # 北京 18:00
+    #
+    # 2026-11-13：签到积分改成「服务端结算 = Base + 套餐 + 连续 + Cable(+1~+9) + …」，
+    # 其中 Cable 按线路指数分档、越差给得越高，同一账号不同时刻能差 8 分。
+    # 于是改成每 30 分钟一个点：脚本先探档位，档位不够就主动不签、等下一个点，
+    # 北京 20:00 之后进入保底时段，不管档位直接签（保连续天数）。
+    - cron: '*/30 * * * *'
 
 # 定时与手动触发可能重叠：同一时间只保留一个运行，避免重复签到与重复推送
 # （合并上游 2026-11：本地 6 个 cron 点，串行排队，不互相取消）
@@ -89,6 +89,14 @@ jobs:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+        # ---- 线路加成闸门（2026-11-13）----
+        # on  = 探档位，不够就等下一个 cron 点（默认）
+        # off = 恢复「到点就签」，用于回滚/排查
+        GLADOS_CABLE_MODE: 'on'
+        # Cable 加成达到该值才签：<90→9 / 90-94→7 / 95-99→5 / 100-109→3 / 110-130→2 / >130→1
+        GLADOS_CABLE_MIN: '7'
+        # 北京时间几点之后不再挑档位、无条件签（保连续签到天数）
+        GLADOS_CABLE_FALLBACK_HOUR: '20'
         # ---- Telegram 推送（新增 2026-10-07）----
         TG_API_ID: ${{ secrets.TG_API_ID }}
         TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -128,6 +136,8 @@ jobs:
       with:
         token: ${{ github.token }}
         repository: ${{ github.repository }}
-        retain_days: 7
-        keep_minimum_runs: 7
+        # 2026-11-13：cron 加密到每 30 分钟（约 48 次/天），
+        # 清理阈值跟着放宽，避免每次运行都去翻几百条历史、把 API 打满。
+        retain_days: 3
+        keep_minimum_runs: 200
         delete_run_by_conclusion_pattern: success

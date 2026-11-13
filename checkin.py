@@ -20,9 +20,11 @@ try:
         checkin_done_today,
         mark_checkin_done,
         mark_pushed,
+        mark_waiting,
         push_checkin_to_telegram,
         push_plain_text,
         pushed_today,
+        waiting_today,
     )
 except Exception:  # 模块缺失时不阻塞签到主流程
     push_checkin_to_telegram = None
@@ -31,6 +33,8 @@ except Exception:  # 模块缺失时不阻塞签到主流程
     mark_pushed = None
     checkin_done_today = None
     mark_checkin_done = None
+    mark_waiting = None
+    waiting_today = None
 
 
 class CheckinStatus(Enum):
@@ -38,6 +42,7 @@ class CheckinStatus(Enum):
 
     SUCCESS = 0
     REPEAT = 1
+    SKIPPED = 2  # 2026-11-13：线路加成档位不够，本次主动不签（不是失败，也不写「今日已完成」）
     FAILURE = -2
 
 
@@ -54,6 +59,7 @@ class APIEndpoint(Enum):
 
     CHECKIN = "/api/user/checkin"
     CHECKIN_CHALLENGE = "/api/user/checkin/challenge"
+    NETWORK_INSIGHT = "/api/user/network-insight"
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
     EXCHANGE = "/api/user/exchange"
@@ -125,6 +131,22 @@ class Config:
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
 
+    # 2026-11-13 新增：线路加成（Cable）闸门
+    #   服务端结算 = Base + 套餐 + 连续 + Cable(+1~+9) + Lucky + Site + ExitIP。
+    #   Cable 按 China Network Insight 指数分档（<90→9、90-94→7、95-99→5、
+    #   100-109→3、110-130→2、>130→1），线路越差给得越多。
+    #   所以签到前先探当前档位，档位不够就先不签，留到下一个 cron 点再探。
+    ENV_CABLE_MODE = "GLADOS_CABLE_MODE"
+    ENV_CABLE_MIN = "GLADOS_CABLE_MIN"
+    ENV_CABLE_FALLBACK_HOUR = "GLADOS_CABLE_FALLBACK_HOUR"
+
+    """闸门开关：on 时启用「档位不够就等」；off 恢复原来的「到点就签」"""
+    DEFAULT_CABLE_MODE = True
+    """档位阈值：探到的 Cable 加成 >= 该值才签（7 = 指数 <95 档）"""
+    DEFAULT_CABLE_MIN = 7
+    """保底小时（北京时间）：到这个点之后不管档位一律签，避免断连续天数"""
+    DEFAULT_CABLE_FALLBACK_HOUR = 20
+
     """默认兑换计划（none 表示不自动兑换）"""
     DEFAULT_EXCHANGE_PLAN = "none"
 
@@ -152,6 +174,9 @@ class Config:
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
+        self.cable_mode: bool = self.DEFAULT_CABLE_MODE
+        self.cable_min: int = self.DEFAULT_CABLE_MIN
+        self.cable_fallback_hour: int = self.DEFAULT_CABLE_FALLBACK_HOUR
         self._load_config()
 
     def _load_config(self) -> None:
@@ -217,6 +242,45 @@ class Config:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
 
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
+
+        # 2026-11-13：线路加成闸门配置
+        mode_env = (os.environ.get(self.ENV_CABLE_MODE) or "").strip().lower()
+        if mode_env in ("off", "false", "0", "no", "n"):
+            self.cable_mode = False
+        elif mode_env in ("on", "true", "1", "yes", "y"):
+            self.cable_mode = True
+        elif mode_env:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_CABLE_MODE}' 的值 '{mode_env}' 无效，按默认开启处理。")
+
+        min_env = (os.environ.get(self.ENV_CABLE_MIN) or "").strip()
+        if min_env:
+            try:
+                parsed_min = int(min_env)
+                if 0 <= parsed_min <= 9:
+                    self.cable_min = parsed_min
+                else:
+                    logger.warning(f"{LogEmoji.WARNING} '{self.ENV_CABLE_MIN}' 取值应在 0~9，已忽略。")
+            except ValueError:
+                logger.warning(f"{LogEmoji.WARNING} '{self.ENV_CABLE_MIN}' 不是整数，已忽略。")
+
+        hour_env = (os.environ.get(self.ENV_CABLE_FALLBACK_HOUR) or "").strip()
+        if hour_env:
+            try:
+                parsed_hour = int(hour_env)
+                if 0 <= parsed_hour <= 23:
+                    self.cable_fallback_hour = parsed_hour
+                else:
+                    logger.warning(f"{LogEmoji.WARNING} '{self.ENV_CABLE_FALLBACK_HOUR}' 取值应在 0~23，已忽略。")
+            except ValueError:
+                logger.warning(f"{LogEmoji.WARNING} '{self.ENV_CABLE_FALLBACK_HOUR}' 不是整数，已忽略。")
+
+        if self.cable_mode:
+            logger.info(
+                f"{LogEmoji.INFO} 线路加成闸门：开启（Cable >= {self.cable_min} 才签，"
+                f"北京 {self.cable_fallback_hour}:00 之后保底签）"
+            )
+        else:
+            logger.info(f"{LogEmoji.INFO} 线路加成闸门：关闭（到点就签）")
 
 
 # 各平台合法 User-Agent（版本号无关，仅平台 token 关键）
@@ -478,12 +542,18 @@ class API:
             streak = 0
         result["streak"] = streak
 
+        # 2026-11-13：服务端把积分构成放在响应的 breakdown 里（网页端也是读这个字段），
+        # 打进日志用于校准「指数档位 → 实发分」，别再把结算当黑盒。
+        result["breakdown"] = _format_breakdown(raw.get("breakdown"))
+
         if code == CheckinStatus.SUCCESS.value:
             self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
             result["code"] = CheckinStatus.SUCCESS
             result["status"] = "签到成功"
             result["points"] = points
             result["message"] = message
+            if result["breakdown"]:
+                self._log("info", LogEmoji.POINTS, f"积分构成：{result['breakdown']}", force=True)
         elif code == CheckinStatus.REPEAT.value:
             self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
             result["code"] = CheckinStatus.REPEAT
@@ -565,6 +635,72 @@ class API:
         else:
             self._log("warning", LogEmoji.WARNING, "获取积分失败")
             return "None 积分", 0
+
+    @log_method
+    def get_cable_points(self, cookies: str) -> Optional[Dict[str, Union[int, str]]]:
+        """读取当前线路加成档位（2026-11-13 新增）
+
+        数据源 /api/user/network-insight（官方「China Network Insight」页面同源），
+        current.cablePoints 就是网页端 Cable 明细用的那个档位分值：
+            指数 < 90 → 9 · 90-94 → 7 · 95-99 → 5 · 100-109 → 3 · 110-130 → 2 · > 130 → 1
+        线路越差给得越多，所以挑指数差的时刻签到才能拿到 8~9 分。
+
+        失败返回 None（由调用方决定是否放行，绝不因为探测失败就漏签）。
+        """
+        url = self._get_full_url(APIEndpoint.NETWORK_INSIGHT.value)
+        response = self._make_request(url, "GET", cookies=cookies)
+        if not response:
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        if not isinstance(data, dict) or data.get("code") not in (0, "0"):
+            return None
+
+        cur = ((data.get("data") or {}).get("current") or {})
+        score = cur.get("score")
+        cable = cur.get("cablePoints")
+        if cable is None and score is not None:
+            # 兜底：接口没给 cablePoints 时按官方分档自己算
+            try:
+                s = float(score)
+            except (TypeError, ValueError):
+                s = 999.0
+            if s < 90:
+                cable = 9
+            elif s < 95:
+                cable = 7
+            elif s < 100:
+                cable = 5
+            elif s < 110:
+                cable = 3
+            elif s <= 130:
+                cable = 2
+            else:
+                cable = 1
+        try:
+            cable_int = int(cable or 0)
+        except (TypeError, ValueError):
+            cable_int = 0
+        try:
+            score_int = int(score) if score is not None else -1
+        except (TypeError, ValueError):
+            score_int = -1
+
+        info: Dict[str, Union[int, str]] = {
+            "score": score_int,
+            "points": cable_int,
+            "level": str(cur.get("level") or ""),
+            "comment": str(cur.get("comment") or ""),
+        }
+        self._log(
+            "info",
+            LogEmoji.POINTS,
+            f"线路加成档位：指数 {score_int}（{info['level']}）→ Cable +{cable_int}",
+            force=True,
+        )
+        return info
 
     @log_method
     def has_checked_in_today(self, cookies: str) -> Tuple[bool, int, str, int]:
@@ -676,6 +812,10 @@ class CheckinResult:
     streak: int = 0
     message: str = ""
     expire: str = ""
+    # 2026-11-13：线路加成闸门相关
+    cable_score: int = -1
+    cable_points: int = -1
+    breakdown: str = ""
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
@@ -716,6 +856,14 @@ def _bj_date() -> str:
     return bj.strftime("%Y-%m-%d")
 
 
+def _bj_hour() -> int:
+    """北京时间当前小时（0-23），用于判断是否进入保底时段"""
+    import datetime
+
+    bj = datetime.datetime.now(datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+    return bj.hour
+
+
 def _num(text) -> str:
     """从 '303 积分' / '388 天' 取数字；含 None 的脏值返回 '未知'"""
     s = str(text or "")
@@ -723,6 +871,52 @@ def _num(text) -> str:
         return "未知"
     m = re.findall(r"-?\d+", s)
     return m[0] if m else s
+
+
+def _fmt_pt(value) -> str:
+    """整数就省掉小数位（9 而不是 9.0），小数保留一位（1.5）"""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "0"
+    return str(int(num)) if num == int(num) else f"{num:.1f}"
+
+
+def _format_breakdown(raw_breakdown) -> str:
+    """把服务端 breakdown 渲染成一行：Base +1 · 套餐 +0 · 连续 +1 · Cable +9 ...
+
+    GLaDOS /api/user/checkin 响应里的 breakdown 字段（网页端「Got/Base/Plan/Streak/
+    Cable/Lucky/Site/Exit IP/Free cap」那张卡就是读它）。字段缺失就跳过，不做假设。
+    """
+    if not isinstance(raw_breakdown, dict):
+        return ""
+    label_map = [
+        ("base", "Base"),
+        ("level", "套餐"),
+        ("streak", "连续"),
+        ("cable", "Cable"),
+        ("lucky", "幸运"),
+        ("site", "站点"),
+        ("exitIp", "出口IP"),
+    ]
+    parts = []
+    for key, label in label_map:
+        if raw_breakdown.get(key) is None:
+            continue
+        parts.append(f"{label} +{_fmt_pt(raw_breakdown.get(key))}")
+
+    extras = []
+    if raw_breakdown.get("cableScore") is not None:
+        extras.append(f"指数 {raw_breakdown.get('cableScore')}")
+    if raw_breakdown.get("streakDays") is not None:
+        extras.append(f"连续 {raw_breakdown.get('streakDays')} 天")
+    if raw_breakdown.get("freeCap") is not None:
+        extras.append(f"免费上限 {_fmt_pt(raw_breakdown.get('freeCap'))}")
+
+    text = " · ".join(parts)
+    if extras:
+        text = f"{text}（{'，'.join(extras)}）" if text else "，".join(extras)
+    return text
 
 
 def _expire_date(left_days, system_time=None) -> str:
@@ -776,10 +970,14 @@ def render_tg(payload: dict) -> str:
             lines.append(f"结果：{r['message']}")
         if status == "签到成功":
             lines.append(f"今日：+{_num(r.get('points'))} 分（日历已打卡）")
+            if r.get("breakdown"):
+                lines.append(f"明细：{r['breakdown']}")
         elif status == "重复签到":
             lines.append("今日：+0 分（今日已签到）")
         elif status == "今日已签到，跳过":
             lines.append("今日：已签到（本次未重复请求）")
+        elif status == "等待线路加成，跳过":
+            lines.append(f"今日：本轮未签（{r.get('message') or '等线路加成'}）")
         if r.get("points_total"):
             total = _num(r.get("points_total"))
             lines.append("积分：未知" if total == "未知" else f"积分：{total}")
@@ -969,6 +1167,61 @@ class Checker:
                 else:
                     self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
 
+    def _cable_gate(self, api: "API", cookie: str, cookie_idx: int, domain: str) -> Tuple[bool, Dict]:
+        """线路加成闸门：返回 (是否放行本次签到, 探测到的档位信息)
+
+        规则（2026-11-13）：
+          - 闸门关闭 / 探测失败 → 放行（宁可按原样签，也不能因为探测抖动漏签）
+          - 已进入保底时段（北京 >= fallback_hour）→ 放行（保连续天数优先）
+          - 档位 >= cable_min → 放行；否则跳过，留给下一个 cron 点
+        """
+        if not self.config.cable_mode:
+            return True, {}
+
+        info = api.get_cable_points(cookie)
+        if not info:
+            self._log(
+                cookie_idx,
+                domain,
+                LogEmoji.WARNING,
+                "线路加成档位探测失败，按原逻辑直接签到（不阻断）",
+                force=True,
+            )
+            return True, {}
+
+        hour = _bj_hour()
+        if hour >= self.config.cable_fallback_hour:
+            self._log(
+                cookie_idx,
+                domain,
+                LogEmoji.WARNING,
+                f"已进入保底时段（北京 {hour} 点 >= {self.config.cable_fallback_hour} 点），"
+                f"不再等档位，直接签到（当前 Cable +{info.get('points')}）",
+                force=True,
+            )
+            return True, info
+
+        if int(info.get("points", 0)) >= self.config.cable_min:
+            self._log(
+                cookie_idx,
+                domain,
+                LogEmoji.SUCCESS,
+                f"线路加成达标（指数 {info.get('score')} → Cable +{info.get('points')} >= "
+                f"+{self.config.cable_min}），本次签到",
+                force=True,
+            )
+            return True, info
+
+        self._log(
+            cookie_idx,
+            domain,
+            LogEmoji.PENDING,
+            f"线路加成不足（指数 {info.get('score')} → Cable +{info.get('points')} < "
+            f"+{self.config.cable_min}），跳过本轮，等下一个定时点",
+            force=True,
+        )
+        return False, info
+
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
 
@@ -1001,12 +1254,34 @@ class Checker:
                     force=True,
                 )
             else:
+                # 2026-11-13：签到前先看线路加成档位。服务端结算里 Cable 占 +1~+9，
+                # 档位不够（指数太好看）就先不签，等下一个 cron 点再探；
+                # 到保底小时之后不管档位一律签，避免断连续天数。
+                allowed, cable_info = self._cable_gate(api, cookie, cookie_idx, domain)
+                if cable_info:
+                    result.cable_score = int(cable_info.get("score", -1))
+                    result.cable_points = int(cable_info.get("points", -1))
+                if not allowed:
+                    result.status = "等待线路加成，跳过"
+                    result.code = CheckinStatus.SKIPPED
+                    result.points = "0"
+                    result.streak = streak
+                    result.message = (
+                        f"当前线路指数 {result.cable_score}（Cable +{result.cable_points}），"
+                        f"未达阈值 +{self.config.cable_min}，本次不签，等下一轮再探"
+                    )
+                    result.points_total = points_str
+                    result.exchange = "未执行（本轮跳过签到）"
+                    self._log(cookie_idx, domain, LogEmoji.PENDING, result.message, force=True)
+                    return result
+
                 self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
                 checkin_result = api.checkin(cookie)
                 result.status = checkin_result["status"]
                 result.code = checkin_result.get("code", CheckinStatus.FAILURE)
                 result.streak = int(checkin_result.get("streak") or 0)
                 result.message = str(checkin_result.get("message") or "")
+                result.breakdown = str(checkin_result.get("breakdown") or "")
                 # 2026-11-10 修复：原来这里没回填 points，通知里永远显示「今日：+0 分」
                 result.points = str(checkin_result.get("points") or "0")
 
@@ -1051,13 +1326,17 @@ class Checker:
         success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
         repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
+        skipped_count = sum(1 for r in results if r["code"] == CheckinStatus.SKIPPED)
 
         status_emoji_map = {
             CheckinStatus.SUCCESS: LogEmoji.SUCCESS,
             CheckinStatus.REPEAT: LogEmoji.REPEAT,
+            CheckinStatus.SKIPPED: LogEmoji.PENDING,
             CheckinStatus.FAILURE: LogEmoji.ERROR,
         }
         title = f"GLaDOS 签到 · 成功 {success_count} · 失败 {fail_count} · 重复 {repeat_count}"
+        if skipped_count:
+            title += f" · 等加成 {skipped_count}"
 
         rows = []
         for i, res in enumerate(results, 1):
@@ -1075,6 +1354,9 @@ class Checker:
                 "streak": res.get("streak", 0),
                 "message": res.get("message", ""),
                 "expire": res.get("expire", ""),
+                "cable_score": res.get("cable_score", -1),
+                "cable_points": res.get("cable_points", -1),
+                "breakdown": res.get("breakdown", ""),
             })
 
         return {
@@ -1083,6 +1365,7 @@ class Checker:
             "success": success_count,
             "fail": fail_count,
             "repeat": repeat_count,
+            "skipped": skipped_count,
         }
 
 
@@ -1119,6 +1402,25 @@ def main():
 
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             payload = checker.format_results()
+
+            # 2026-11-13：全部任务都在「等线路加成」→ 本轮刻意不签。
+            # 写等待标记（让工作流兜底通知不误报异常），不推送、不写「今日已完成」，
+            # 让后面的 cron 点继续探档位；真签成功了才写完成标记。
+            all_skipped = (
+                payload.get("skipped", 0) > 0
+                and payload.get("success", 0) == 0
+                and payload.get("fail", 0) == 0
+                and payload.get("repeat", 0) == 0
+            )
+            if all_skipped:
+                logger.info(
+                    f"{LogEmoji.PENDING} 本轮全部为「等线路加成」跳过，未签到、未推送；"
+                    f"等下一个定时点继续探档位"
+                )
+                if mark_waiting:
+                    mark_waiting()
+                logger.info(f"{LogEmoji.END} 签到完成（本轮跳过：等加成档位）")
+                return
 
             # fork 定制（2026-10-11 用户要求）：本次「全是重复签到」也要推送，
             # 标题标注「重复运行」，便于核对是不是又多跑了一次；tg_notify 已推送会打标记，

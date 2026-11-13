@@ -155,6 +155,36 @@ def mark_checkin_done():
 
 
 # --------------------------------------------------------------------------- #
+# 「本轮在等线路加成，主动没签」标记（2026-11-13 新增）
+#
+#   Cable 加成按线路指数分档（<90 → +9，越差越高），所以签到前会先探档位，
+#   档位不够就跳过本轮、等下一个 cron 点。这种「主动不签」既不是失败也不是完成，
+#   因此单独写一个标记，用来告诉工作流兜底通知「别报异常」，也避免刷屏。
+#   一旦真正签成功，checkin-done 标记会覆盖语义（兜底逻辑优先看那个）。
+# --------------------------------------------------------------------------- #
+def _waiting_flag_path():
+    return os.path.join(_state_dir(), "waiting-%s" % _bj_today())
+
+
+def waiting_today():
+    """今天（北京日期）是否有过「等加成主动跳过」的记录"""
+    try:
+        return os.path.exists(_waiting_flag_path())
+    except Exception:
+        return False
+
+
+def mark_waiting():
+    try:
+        d = _state_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(_waiting_flag_path(), "w", encoding="utf-8") as f:
+            f.write(_bj_today())
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # 发送
 # --------------------------------------------------------------------------- #
 def _proxy():
@@ -279,6 +309,9 @@ def _main(argv):
         body = rest[1] if len(rest) > 1 else ""
         if already_pushed() or pushed_today() or checkin_done_today():
             print("[tg] 签到脚本已自行推送过（或今日通知已发/今日已签到成功），跳过兜底通知", flush=True)
+            return 0
+        if waiting_today():
+            print("[tg] 今日脚本在等线路加成档位（主动跳过，非异常），跳过兜底通知", flush=True)
             return 0
         url = run_url()
         if not body:
