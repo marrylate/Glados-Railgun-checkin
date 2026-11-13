@@ -88,7 +88,14 @@ def main():
             args=["--disable-blink-features=AutomationControlled", "--no-first-run", "--mute-audio"],
         )
         ctx = browser.new_context(
-            viewport={"width": 1280, "height": 900}, locale="zh-CN", timezone_id="Asia/Shanghai"
+            viewport={"width": 1280, "height": 900},
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            # cookie 是 Windows 端登录的，Linux UA 会被判 device-mismatch（code 4）
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+            ),
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         ctx.add_cookies([{"name": k, "value": v, "domain": ".glados.cloud", "path": "/"} for k, v in pairs.items()])
@@ -115,6 +122,7 @@ def main():
             r = page.evaluate(RENDER_JS, {"sitekey": sitekey, "nonce": nonce})
             out["render"] = r
             t0 = time.time()
+            clicked = 0
             while time.time() - t0 < 120:
                 st = page.evaluate("() => ({tok: window.__tok, err: window.__err, int: window.__int})")
                 if st.get("tok"):
@@ -124,6 +132,29 @@ def main():
                 if st.get("err"):
                     out["turnstile_error"] = st["err"]
                     break
+                # 云端 runner 上 Turnstile 会要交互：试着点一下验证框（最多 3 次）
+                if st.get("int") and clicked < 3 and time.time() - t0 > 2:
+                    clicked += 1
+                    ok = False
+                    try:
+                        frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+                        frame.locator('input[type="checkbox"]').first.click(timeout=4000)
+                        ok = True
+                        out["click_mode"] = "checkbox"
+                    except Exception:
+                        try:
+                            el = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+                            box = el.bounding_box() if el else None
+                            if box:
+                                page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                                ok = True
+                                out["click_mode"] = "coord"
+                        except Exception:
+                            pass
+                    out["clicks"] = clicked
+                    out["click_ok"] = ok
+                    page.wait_for_timeout(3000)
+                    continue
                 page.wait_for_timeout(800)
             out["interactive_required"] = bool(page.evaluate("window.__int"))
         out["got_token"] = bool(token)
