@@ -1,0 +1,45 @@
+name: turnstile-probe
+
+# 一次性诊断用：验证 GitHub Actions runner（xvfb 虚拟显示器 + 有头 Chromium）
+# 能否通过 GLaDOS 签到新加的 Cloudflare Turnstile。
+# 只有手动触发，不参与日常签到。
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_post:
+        description: "1 = 真的提交一次签到（今日已签会返回 code:1，不会重复加分）"
+        required: false
+        default: "1"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install playwright + chromium
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Probe Turnstile (xvfb, headed chromium)
+        continue-on-error: true
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+          PROBE_POST: ${{ github.event.inputs.probe_post }}
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x900x24" python tools/turnstile_probe.py
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turnstile-probe-shot
+          path: /tmp/probe.png
+          if-no-files-found: ignore
