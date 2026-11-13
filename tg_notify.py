@@ -311,8 +311,22 @@ def _main(argv):
             print("[tg] 签到脚本已自行推送过（或今日通知已发/今日已签到成功），跳过兜底通知", flush=True)
             return 0
         if waiting_today():
-            print("[tg] 今日脚本在等线路加成档位（主动跳过，非异常），跳过兜底通知", flush=True)
-            return 0
+            # 白天的「跳过」是正常的：2026-11-14 起签到需要 Cloudflare Turnstile，
+            # HTTP 侧一律跳过、由本机浏览器脚本补签（它自己会推成功通知）。
+            # 所以这里白天保持安静，只在 21:00 之后还没动静时才提醒一次。
+            import datetime as _dt
+
+            hour = (_dt.datetime.utcnow() + _dt.timedelta(hours=8)).hour
+            if hour < 21:
+                print("[tg] 今日脚本在等条件（需浏览器验证/等加成，主动跳过，非异常），跳过兜底通知", flush=True)
+                return 0
+            title = "GLaDOS 今日还没签到成功"
+            body = (
+                "HTTP 侧签到需要 Cloudflare Turnstile（已跳过，由本机浏览器补签）。"
+                "现在已过 21 点仍未签上，电脑可能没开机或没登录 —— 建议手动打开 "
+                "https://glados.cloud/console/checkin 点一下 Checkin。"
+            )
+            print("[tg] 已过 21 点仍未签到，推送提醒", flush=True)
         url = run_url()
         if not body:
             body = "签到脚本未完成推送（可能秒退或崩溃），请查看 Actions 运行日志。"

@@ -446,6 +446,20 @@ class API:
             self._log("warning", LogEmoji.WARNING, "签到 challenge 缺少 nonce，按旧协议提交", force=True)
             return None
 
+        # 2026-11-14：challenge 里带 turnstile sitekey = 服务端要求真实 Cloudflare
+        # Turnstile token。纯 HTTP 客户端拿不到（无头浏览器也过不去），POST 必被拒：
+        #   {"code":5,"reason":"turnstile","message":"Cloudflare verification failed..."}
+        # 所以这里直接不打签到接口，标记「需浏览器」交给本机脚本补签，避免每天刷失败。
+        if data.get("turnstile"):
+            self._need_turnstile = True
+            self._log(
+                "warning",
+                LogEmoji.PENDING,
+                "服务端要求 Cloudflare Turnstile 验证（challenge 带 sitekey），HTTP 脚本无法通过，本次跳过 → 本机浏览器签到",
+                force=True,
+            )
+            return None
+
         # 与网页端一致：拿到 challenge 后等待一小段再提交，太快会被判定为脚本
         time.sleep(CHALLENGE_DELAY_SECONDS)
         proof = hashlib.sha256(f"{nonce}.{CHALLENGE_SUFFIX}".encode()).hexdigest()
@@ -480,7 +494,15 @@ class API:
         拿不到回退旧表单提交（服务端仍放行，但只给 1 积分）。
         """
         payload: Dict[str, str] = dict(data or {})
+        self._need_turnstile = False
         challenge = self._get_checkin_challenge(cookies, user_agent)
+        if getattr(self, "_need_turnstile", False):
+            # 交给 _parse_checkin 归类成「待浏览器验证」（非失败），不推送
+            return {
+                "code": 5,
+                "reason": "turnstile",
+                "message": "服务端要求 Cloudflare 浏览器验证，本机浏览器脚本已接管",
+            }
         if challenge:
             nonce, proof = challenge
             payload["nonce"] = nonce
@@ -562,6 +584,23 @@ class API:
             result["message"] = message
         else:
             # 失败分支：按 code 细分诊断，便于快速定位根因
+            if code == 5 or raw.get("reason") == "turnstile":
+                # 2026-11-14：GLaDOS 给签到加了 Cloudflare Turnstile，token 只能由真浏览器
+                # 在页面里拿，HTTP/无头都不行。这不算失败（服务端提示 Nothing was recorded，
+                # 连续天数不受影响），分类成 SKIPPED 让本机浏览器脚本继续补签、也不误报。
+                self._log(
+                    "warning",
+                    LogEmoji.PENDING,
+                    f"服务端要求 Cloudflare Turnstile 验证(code={code}, reason={raw.get('reason')})，"
+                    "本次跳过不推送 → 交本机浏览器签到",
+                    force=True,
+                )
+                result["code"] = CheckinStatus.SKIPPED
+                result["status"] = "待浏览器验证"
+                result["points"] = "0"
+                result["message"] = message
+                result["need_browser"] = True
+                return result
             if code == 4:
                 reason = raw.get("reason")
                 if reason == "device-mismatch":
@@ -1336,7 +1375,7 @@ class Checker:
         }
         title = f"GLaDOS 签到 · 成功 {success_count} · 失败 {fail_count} · 重复 {repeat_count}"
         if skipped_count:
-            title += f" · 等加成 {skipped_count}"
+            title += f" · 待处理 {skipped_count}"
 
         rows = []
         for i, res in enumerate(results, 1):
@@ -1419,7 +1458,7 @@ def main():
                 )
                 if mark_waiting:
                     mark_waiting()
-                logger.info(f"{LogEmoji.END} 签到完成（本轮跳过：等加成档位）")
+                logger.info(f"{LogEmoji.END} 签到完成（本轮跳过：等加成档位 / 需浏览器验证，均交后续处理）")
                 return
 
             # fork 定制（2026-10-11 用户要求）：本次「全是重复签到」也要推送，
