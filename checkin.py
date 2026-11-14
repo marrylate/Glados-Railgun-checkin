@@ -343,6 +343,14 @@ class TurnstileSolver:
     CAPSOLVER_RESULT = "https://api.capsolver.com/getTaskResult"
     TWOCAPTCHA_IN = "https://2captcha.com/in.php"
     TWOCAPTCHA_RES = "https://2captcha.com/res.php"
+    # 2026-11-14 新增：用户反馈 capsolver 起充 $6 太贵，补两家低价平台
+    #   yescaptcha（国内，支付宝充值 ¥10 起，Turnstile 25 点/次 = ¥0.025，
+    #              1000 点 = ¥1，按每天 1 次算一年约 ¥9）
+    #   capmonster（$1.30/1000，官方给 $0.10 试用余额）
+    YESCAPTCHA_CREATE = "https://api.yescaptcha.com/createTask"
+    YESCAPTCHA_RESULT = "https://api.yescaptcha.com/getTaskResult"
+    CAPMONSTER_CREATE = "https://api.capmonster.cloud/createTask"
+    CAPMONSTER_RESULT = "https://api.capmonster.cloud/getTaskResult"
 
     def __init__(self, provider: str = "", api_key: str = "", verbose: bool = False):
         self.provider = (provider or "").strip().lower()
@@ -353,7 +361,7 @@ class TurnstileSolver:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_key) and self.provider in ("capsolver", "2captcha")
+        return bool(self.api_key) and self.provider in ("capsolver", "2captcha", "yescaptcha", "capmonster")
 
     def solve(
         self, sitekey: str, page_url: str, action: str = "checkin", cdata: str = "", timeout: int = 120
@@ -362,42 +370,67 @@ class TurnstileSolver:
         if not self.enabled:
             return None
         try:
-            if self.provider == "capsolver":
-                return self._capsolver(sitekey, page_url, action, cdata, timeout)
-            return self._two_captcha(sitekey, page_url, action, cdata, timeout)
+            if self.provider == "2captcha":
+                return self._two_captcha(sitekey, page_url, action, cdata, timeout)
+            return self._task_api(sitekey, page_url, action, cdata, timeout)
         except Exception as e:
             logger.warning(f"{LogEmoji.WARNING} 打码服务调用异常：{e}")
             return None
 
-    def _capsolver(self, sitekey: str, page_url: str, action: str, cdata: str, timeout: int) -> Optional[str]:
-        task: Dict[str, object] = {
-            "type": "AntiTurnstileTaskProxyLess",
-            "websiteURL": page_url,
-            "websiteKey": sitekey,
-        }
-        meta: Dict[str, str] = {}
-        if action:
-            meta["action"] = action
-        if cdata:
-            meta["cdata"] = cdata
-        if meta:
-            task["metadata"] = meta
+    # createTask / getTaskResult 协议的平台差异：create 地址、result 地址、任务类型、附加字段写法
+    TASK_API = {
+        "capsolver": ("CAPSOLVER_CREATE", "CAPSOLVER_RESULT", "AntiTurnstileTaskProxyLess", "metadata"),
+        "capmonster": ("CAPMONSTER_CREATE", "CAPMONSTER_RESULT", "TurnstileTaskProxyless", "flat"),
+        "yescaptcha": ("YESCAPTCHA_CREATE", "YESCAPTCHA_RESULT", "TurnstileTaskProxyless", "flat"),
+    }
 
-        logger.info(f"{LogEmoji.INFO} 提交 Turnstile 打码任务（capsolver）…")
+    def _task_api(self, sitekey: str, page_url: str, action: str, cdata: str, timeout: int) -> Optional[str]:
+        """capsolver / capmonster / yescaptcha 共用的 createTask + 轮询 getTaskResult"""
+        create_attr, result_attr, task_type, style = self.TASK_API.get(
+            self.provider, self.TASK_API["capsolver"]
+        )
+        create_url = getattr(self, create_attr)
+        result_url = getattr(self, result_attr)
+
+        extra: Dict[str, str] = {}
+        if action:
+            extra["action"] = action
+        if cdata:
+            extra["cdata"] = cdata
+
+        def build(use_extra: bool) -> Dict[str, object]:
+            task: Dict[str, object] = {"type": task_type, "websiteURL": page_url, "websiteKey": sitekey}
+            if use_extra and extra:
+                if style == "metadata":
+                    task["metadata"] = dict(extra)
+                else:
+                    task.update(extra)
+            return task
+
+        logger.info(f"{LogEmoji.INFO} 提交 Turnstile 打码任务（{self.provider}）…")
         resp = requests.post(
-            self.CAPSOLVER_CREATE, json={"clientKey": self.api_key, "task": task}, timeout=30
+            create_url, json={"clientKey": self.api_key, "task": build(True)}, timeout=30
         ).json()
+        if resp.get("errorId") and extra:
+            # 有的平台不认 action/cdata 字段名，去掉附加字段再试一次（token 可能仍被站点接受）
+            logger.warning(
+                f"{LogEmoji.WARNING} 带 action/cdata 提交被拒（{resp.get('errorCode')}），改用最简任务重试"
+            )
+            resp = requests.post(
+                create_url, json={"clientKey": self.api_key, "task": build(False)}, timeout=30
+            ).json()
         if resp.get("errorId"):
             logger.warning(
                 f"{LogEmoji.WARNING} 打码任务创建失败：{resp.get('errorCode')} {resp.get('errorDescription')}"
             )
             return None
+
         task_id = resp.get("taskId")
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(3)
             r = requests.post(
-                self.CAPSOLVER_RESULT, json={"clientKey": self.api_key, "taskId": task_id}, timeout=30
+                result_url, json={"clientKey": self.api_key, "taskId": task_id}, timeout=30
             ).json()
             if r.get("errorId"):
                 logger.warning(
