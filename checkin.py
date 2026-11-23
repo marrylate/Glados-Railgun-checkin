@@ -147,6 +147,7 @@ class Config:
     ENV_CABLE_MODE = "GLADOS_CABLE_MODE"
     ENV_CABLE_MIN = "GLADOS_CABLE_MIN"
     ENV_CABLE_FALLBACK_HOUR = "GLADOS_CABLE_FALLBACK_HOUR"
+    ENV_CABLE_END_HOUR = "GLADOS_CABLE_END_HOUR"
 
     """闸门开关：on 时启用「档位不够就等」；off 恢复原来的「到点就签」"""
     DEFAULT_CABLE_MODE = True
@@ -154,6 +155,11 @@ class Config:
     DEFAULT_CABLE_MIN = 7
     """保底小时（北京时间）：到这个点之后不管档位一律签，避免断连续天数"""
     DEFAULT_CABLE_FALLBACK_HOUR = 20
+    """保底时段跨零点结束小时（北京时间）：0~该小时也算保底时段。
+    2026-11-23 事故：CF Worker 的派发点全在北京 00:05/00:20/00:45/01:15，
+    而原判定只认 hour >= 20，凌晨这批派发全被档位闸门 SKIPPED，加上本机兜底
+    当时被禁用，导致 11-23 全天漏签。把凌晨这 3 小时也纳入保底窗口即可。"""
+    DEFAULT_CABLE_END_HOUR = 2
 
     """默认兑换计划（none 表示不自动兑换）"""
     DEFAULT_EXCHANGE_PLAN = "none"
@@ -185,6 +191,7 @@ class Config:
         self.cable_mode: bool = self.DEFAULT_CABLE_MODE
         self.cable_min: int = self.DEFAULT_CABLE_MIN
         self.cable_fallback_hour: int = self.DEFAULT_CABLE_FALLBACK_HOUR
+        self.cable_end_hour: int = self.DEFAULT_CABLE_END_HOUR
         self.solver_provider: str = ""
         self.solver_key: str = ""
         self._load_config()
@@ -295,10 +302,21 @@ class Config:
             except ValueError:
                 logger.warning(f"{LogEmoji.WARNING} '{self.ENV_CABLE_FALLBACK_HOUR}' 不是整数，已忽略。")
 
+        end_hour_env = (os.environ.get(self.ENV_CABLE_END_HOUR) or "").strip()
+        if end_hour_env:
+            try:
+                parsed_end = int(end_hour_env)
+                if 0 <= parsed_end <= 23:
+                    self.cable_end_hour = parsed_end
+                else:
+                    logger.warning(f"{LogEmoji.WARNING} '{self.ENV_CABLE_END_HOUR}' 取值应在 0~23，已忽略。")
+            except ValueError:
+                logger.warning(f"{LogEmoji.WARNING} '{self.ENV_CABLE_END_HOUR}' 不是整数，已忽略。")
+
         if self.cable_mode:
             logger.info(
                 f"{LogEmoji.INFO} 线路加成闸门：开启（Cable >= {self.cable_min} 才签，"
-                f"北京 {self.cable_fallback_hour}:00 之后保底签）"
+                f"北京 {self.cable_fallback_hour}:00~23:59 与 00:00~{self.cable_end_hour}:59 保底签）"
             )
         else:
             logger.info(f"{LogEmoji.INFO} 线路加成闸门：关闭（到点就签）")
@@ -1415,9 +1433,9 @@ class Checker:
     def _cable_gate(self, api: "API", cookie: str, cookie_idx: int, domain: str) -> Tuple[bool, Dict]:
         """线路加成闸门：返回 (是否放行本次签到, 探测到的档位信息)
 
-        规则（2026-11-13）：
+        规则（2026-11-13 起，2026-11-23 修跨零点）：
           - 闸门关闭 / 探测失败 → 放行（宁可按原样签，也不能因为探测抖动漏签）
-          - 已进入保底时段（北京 >= fallback_hour）→ 放行（保连续天数优先）
+          - 已进入保底时段（北京 >= fallback_hour 或 <= end_hour）→ 放行（保连续天数优先）
           - 档位 >= cable_min → 放行；否则跳过，留给下一个 cron 点
         """
         if not self.config.cable_mode:
@@ -1435,12 +1453,15 @@ class Checker:
             return True, {}
 
         hour = _bj_hour()
-        if hour >= self.config.cable_fallback_hour:
+        # 2026-11-23：保底时段跨零点判定。晚间 >= fallback_hour 与凌晨 <= end_hour 都算保底。
+        in_fallback = hour >= self.config.cable_fallback_hour or hour <= self.config.cable_end_hour
+        if in_fallback:
             self._log(
                 cookie_idx,
                 domain,
                 LogEmoji.WARNING,
-                f"已进入保底时段（北京 {hour} 点 >= {self.config.cable_fallback_hour} 点），"
+                f"已进入保底时段（北京 {hour} 点；窗口为 >= {self.config.cable_fallback_hour} 点"
+                f" 或 <= {self.config.cable_end_hour} 点），"
                 f"不再等档位，直接签到（当前 Cable +{info.get('points')}）",
                 force=True,
             )
