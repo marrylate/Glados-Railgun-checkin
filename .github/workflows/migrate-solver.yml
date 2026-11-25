@@ -1,0 +1,27 @@
+name: migrate-solver-secrets
+
+# 一次性工具：把本仓库的打码密钥转存到自建仓库 marrylate/glados-daily-checkin
+# 用完即删。值不会出现在日志里。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.13'
+    - name: Install deps
+      run: pip install --quiet pynacl requests
+    - name: Migrate
+      run: python tools/migrate_solver.py
+      env:
+        SRC_SOLVER: ${{ secrets.GLADOS_SOLVER }}
+        SRC_KEY: ${{ secrets.SOLVER_API_KEY }}
+        PAT: ${{ secrets.MIGRATE_PAT }}
