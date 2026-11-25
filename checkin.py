@@ -1644,6 +1644,7 @@ def main():
     """主函数"""
     exit_code = 0
     config = None
+    skip_push = False
 
     # 2026-11-10 用户要求：只要今天签到成功过（已推送过 TG），后面所有兜底触发点
     # 进来就直接退出 —— 不登录、不查状态、不 POST 签到接口、不连 TG，
@@ -1690,9 +1691,11 @@ def main():
                 logger.info(f"{LogEmoji.END} 签到完成（本轮跳过：等加成档位 / 需浏览器验证，均交后续处理）")
                 return
 
-            # fork 定制（2026-10-11 用户要求）：本次「全是重复签到」也要推送，
-            # 标题标注「重复运行」，便于核对是不是又多跑了一次；tg_notify 已推送会打标记，
-            # 工作流兜底通知不会重复刷屏。
+            # 2026-11-26 用户反馈：本机（真浏览器）与云端两套并行，
+            # 本机签完后云端再到点检查，会推一条「今日已签到，跳过」，
+            # 频道里就成了「✅ 签到成功」+「🔄 今日已签到，跳过」两条。
+            # 跳过分支本身没有新信息（今天必然已经有人签了，且签的那方已经推过），
+            # 所以改成只写日志、不推 TG。真签到成功 / 失败 / 等档位 仍照常推。
             all_repeat = (
                 payload.get("success", 0) == 0
                 and payload.get("fail", 0) == 0
@@ -1700,7 +1703,11 @@ def main():
             )
             if all_repeat:
                 payload["title"] = f"🔁 {payload['title']}（重复运行：今日已签到）"
-                logger.info(f"{LogEmoji.INFO} 本次全部为「重复签到」，按用户要求仍推送通知（标注为重复运行）。")
+                skip_push = True
+                logger.info(
+                    f"{LogEmoji.INFO} 本次全部为「今日已签到，跳过」，不推送 TG"
+                    f"（避免与本机签到通知重复）"
+                )
 
             logger.info(f"\n{LogEmoji.END} ========== 签到总结 ==========\n{payload['title']}\n{render_payload(payload)}")
 
@@ -1720,8 +1727,11 @@ def main():
         exit_code = 1
 
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config)
-    push_service.send(payload["title"], payload)
+    if skip_push:
+        logger.info(f"{LogEmoji.INFO} 已跳过推送（今日已签到，无新增信息）")
+    else:
+        push_service = PushService(config)
+        push_service.send(payload["title"], payload)
     logger.info(f"{LogEmoji.END} 签到完成")
 
     if exit_code != 0:
