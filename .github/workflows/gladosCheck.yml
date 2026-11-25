@@ -1,0 +1,35 @@
+name: glados-checkin
+
+# 纯转发入口（2026-11-26）
+#
+# CF Worker（gh-checkin-cron）的 4 个定时点还在往本仓库的 gladosCheck.yml 派发，
+# 而 Cloudflare 侧没有本机部署凭据，改不了目标仓库。
+# 所以这里只做一件事：把派发原样转给自建仓库 marrylate/glados-daily-checkin。
+# 签到逻辑、cookie、打码、TG 推送全部在那边，本仓库不参与签到。
+#
+# 等 CF Worker 的目标改成新仓库后，这个文件可以直接删掉。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  forward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+    - name: Forward to glados-daily-checkin
+      env:
+        PAT: ${{ secrets.FORWARD_PAT }}
+      run: |
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+          -H "Authorization: Bearer $PAT" \
+          -H "Accept: application/vnd.github+json" \
+          https://api.github.com/repos/marrylate/glados-daily-checkin/actions/workflows/checkin.yml/dispatches \
+          -d '{"ref":"master"}')
+        echo "forward -> HTTP $code"
+        if [ "$code" != "204" ]; then
+          echo "转发失败，CF 派发无法抵达新仓库"
+          exit 1
+        fi
